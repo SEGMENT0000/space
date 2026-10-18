@@ -1,0 +1,464 @@
+/* ---------------------------------------------------------------
+   Explorer chrome — transparent topbar (history, breadcrumb, filter,
+   sort, palette, rail toggle), the map panel with its overlay
+   readouts and hover-card seat, the inspector rail panel, the
+   context menu, and the transparent mono status strip
+   (ExplorerView.tsx).
+
+   The world: chrome strips sit directly on the ground (--bg); the
+   map and the rail are .panel surfaces. Only floating layers carry
+   shadows: .float (menu), .hovercard, and the narrow-viewport rail
+   overlay. The rail's internals live in rail.css; the treemap
+   instruments (crop marks, zoom readout) in map.css; the preview
+   plates in preview.css.
+   --------------------------------------------------------------- */
+
+/* --------------------------------------------------- topbar
+   A transparent strip on the ground — no border, no fill. The
+   panels below it carry the surface; the strip only arranges
+   controls. back/forward, crumbs, then right: search, sort, Ctrl K,
+   rail toggle. */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 46px;
+  padding: 0 10px;
+  flex: none;
+  background: transparent;
+}
+
+.nav-pair {
+  display: flex;
+  gap: 2px;
+}
+
+/* keycaps on this strip clear 4.5:1 (primitives' .kbd is quieter) */
+.topbar .kbd,
+.menu .kbd {
+  color: var(--ink-2);
+}
+
+.pal-hint {
+  display: flex;
+  align-items: center;
+  flex: none;
+  border: none;
+  background: transparent;
+  padding: 3px 6px;
+  border-radius: var(--r-chip);
+  cursor: default;
+  transition: background 120ms var(--ease-out);
+}
+.pal-hint:hover {
+  background: var(--fill-hover);
+}
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1;
+  gap: 1px;
+}
+.crumb {
+  font: inherit;
+  font-weight: 500;
+  font-size: 13.5px;
+  border: none;
+  background: transparent;
+  color: var(--ink-2);
+  padding: 3px 6px;
+  border-radius: var(--r-row);
+  cursor: default;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color 120ms var(--ease-out), background 120ms var(--ease-out);
+}
+.crumb:hover {
+  color: var(--ink);
+  background: var(--fill-hover);
+}
+.crumb:last-child {
+  color: var(--ink);
+}
+/* one crumb cell: separator + button, never allowed to squeeze the row */
+.crumb-slot {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.crumb-sep {
+  color: var(--ink-3);
+  display: flex;
+  align-items: center;
+  flex: none;
+}
+.crumb-ellipsis {
+  color: var(--ink-3);
+  padding: 0 2px;
+}
+
+.searchbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  width: 200px;
+  padding: 0 5px 0 9px;
+  border-radius: var(--r-ctl);
+  background: var(--bg-sunken);
+  color: var(--ink-2);
+  transition: background 120ms var(--ease-out), width 200ms var(--ease-out);
+}
+.searchbox:focus-within {
+  background: var(--bg-elevated);
+  box-shadow: 0 0 0 0.5px var(--hairline-strong), 0 0 0 2.5px var(--focus);
+  width: 240px;
+}
+.searchbox input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 12.5px;
+  color: var(--ink);
+}
+
+/* --------------------------------------------------- content row
+   One row, two .panel surfaces: the map (all remaining width) and
+   the 300px inspector rail. Trickles of ground visible through the
+   8px gaps are the panel language at rest. */
+
+.content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 8px;
+  padding: 0 8px 8px;
+  position: relative;
+}
+
+/* the map panel: the renderer measures its own container, so the
+   treemap always fills this panel edge to edge — no letterbox */
+.map-panel {
+  flex: 1;
+  min-width: 0;
+}
+
+.map-wrap {
+  position: absolute;
+  inset: 0;
+}
+
+/* the rail panel seats the rail component; the rail itself paints
+   no surface of its own (the panel is the surface) and fills it */
+.rail-panel {
+  flex: none;
+  width: 300px;
+}
+.rail-panel .rail {
+  position: static;
+  height: 100%;
+  width: 100%;
+  min-width: 0;
+  border-left: none;
+  background: transparent;
+  box-shadow: none;
+}
+
+/* the treemap canvas layers (rendered by TreemapCanvas) */
+.map-gl,
+.map-labels {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.map-labels {
+  pointer-events: none;
+}
+
+/* --------------------------------------------------- map overlays
+   Chips: quiet readouts seated on the map — bg-elevated fill and a
+   hairline edge (panel-like), no shadow: they are instruments, not
+   floating layers. Sentence-case micro copy, figures as .num mono. */
+.map-chip {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: calc(100% - 32px);
+  padding: 5px 11px;
+  background: var(--bg-elevated);
+  border: 0.5px solid var(--hairline);
+  border-radius: var(--r-ctl);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.005em;
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  z-index: 6;
+}
+.map-chip .num {
+  font-size: 10.5px;
+  color: var(--ink);
+}
+/* the once-ever gesture chip rides the base clock; is-gone is the
+   fade ExplorerView drives after 6s or the first pointer touch */
+.map-chip.map-first {
+  transition: opacity 450ms var(--ease-out);
+}
+.map-chip.map-first.is-gone {
+  opacity: 0;
+}
+/* action toasts sit above the chip row so they never collide */
+.map-chip.map-toast {
+  bottom: 48px;
+}
+
+/* Honest states of the panel: a dot-matrix bed with the real reason
+   (loading / empty folder / failed read). Opaque, so the canvas's
+   cleared background can never tint the panel (its WebGL clear color
+   is the ground tone, not the elevated panel tone). */
+.map-state {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--bg-elevated);
+  z-index: 5;
+  pointer-events: none;
+}
+.map-state-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  max-width: min(70%, 420px);
+  text-align: center;
+}
+.map-state-copy {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.005em;
+  color: var(--ink-2);
+}
+.map-state-reason {
+  margin: 0;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  max-height: 3em;
+  overflow: hidden;
+  white-space: normal;
+  word-break: break-word;
+}
+
+/* --------------------------------------------------- context menu
+   A floating layer: .float carries the surface (elevated fill,
+   --r-menu radius, shadow-menu). Rows are 24px, sentence-case, with
+   a mono keycap column every shortcut of which is actually wired. */
+.menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 200px;
+  padding: 5px;
+  animation: menu-in 120ms var(--ease-out) both;
+}
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  width: 100%;
+  height: 24px;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--ink);
+  padding: 0 10px;
+  border-radius: var(--r-row);
+  cursor: default;
+  text-align: left;
+}
+.menu-item:hover {
+  /* accent fill, darkened just enough that its ink keeps 4.5:1 */
+  background: color-mix(in srgb, var(--accent) 85%, black);
+  color: var(--accent-ink);
+}
+.menu-item:active {
+  background: color-mix(in srgb, var(--accent) 75%, black);
+}
+/* the keycap lifts to the elevated surface on the accent row */
+.menu-item:hover .kbd {
+  color: var(--ink-2);
+  background: var(--bg-elevated);
+  border-color: transparent;
+}
+.menu-sep {
+  height: 1px;
+  background: var(--hairline);
+  margin: 5px 8px;
+}
+
+/* --------------------------------------------------- statusbar
+   A transparent strip below the panels: mono tabular readouts left,
+   quiet sentence-case actions right. No border — the panels above
+   carry the division; readouts clip rather than wrap so the actions
+   always survive a narrow window. */
+.statusbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 10px;
+  background: transparent;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  color: var(--ink-2);
+}
+.sb-readouts {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.sb-cell {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  flex: none;
+}
+/* the quiet Geist key; the paired value carries the mono figure */
+.statusbar .sb-key {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 11px;
+  letter-spacing: 0.005em;
+  color: var(--ink-3);
+}
+.statusbar .num {
+  color: var(--ink);
+  font-weight: 500;
+}
+/* hidden-categories chip: the swatch repeats the hatch texture —
+   "filtered" reads by texture first (Two-Channel Rule), the word confirms.
+   As a <button> it is also the switch — click unhides every category —
+   so it carries the status-btn's pointer affordance and hover step. */
+.sb-hid .chip-dot {
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent 0 2px,
+    var(--ink-3) 2px 3px
+  );
+}
+button.sb-hid {
+  appearance: none;
+  cursor: default;
+  transition: background 120ms var(--ease-out);
+}
+button.sb-hid:hover {
+  background: var(--fill-hover);
+}
+.sb-readouts .chip {
+  flex: none;
+}
+
+.sb-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+.status-btn {
+  font: inherit;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--r-row);
+  background: transparent;
+  color: var(--ink-2);
+  cursor: default;
+  transition: background 120ms var(--ease-out), color 120ms var(--ease-out);
+}
+.status-btn:hover {
+  background: var(--fill-hover);
+  color: var(--ink);
+}
+.status-btn:active {
+  background: var(--fill-active);
+}
+
+/* --------------------------------------------------- responsive
+   ≤900px: the rail overlays the map (default closed per state init)
+   instead of squeezing it; the overlay shadow is its floating right. */
+@media (max-width: 900px) {
+  .rail-panel {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 6;
+    box-shadow: -12px 0 32px rgba(0, 0, 0, 0.28);
+  }
+  .searchbox {
+    width: 160px;
+  }
+  .searchbox:focus-within {
+    width: 190px;
+  }
+  .sb-readouts {
+    gap: 10px;
+  }
+}
+
+/* ≤560px: drop the sort control (the Ctrl K palette retains sorting) and
+   let the search box carry the strip; the statusbar keeps items, size,
+   % of volume and hidden categories — files stay in the rail. */
+@media (max-width: 560px) {
+  .topbar .seg {
+    display: none;
+  }
+  .searchbox {
+    width: 128px;
+  }
+  .searchbox:focus-within {
+    width: 156px;
+  }
+  .sb-readouts {
+    gap: 8px;
+  }
+  .sb-cell.sb-opt {
+    display: none;
+  }
+}

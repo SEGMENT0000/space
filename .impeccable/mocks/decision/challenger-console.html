@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>space · Explorer — Graphite Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Spline+Sans+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box}
+html,body{width:1440px;height:900px;margin:0;overflow:hidden}
+body{background:#1B1C1F;color:#DCDCD8;font:400 13px/1.35 Barlow,sans-serif;-webkit-font-smoothing:antialiased;display:flex;flex-direction:column}
+.mono,.v,.sz,.pc{font-family:"Spline Sans Mono",monospace;font-variant-numeric:tabular-nums}
+button,input{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+.bar{height:44px;flex:none;display:flex;align-items:center;gap:16px;padding:0 16px;border-bottom:1px solid #33353A;background:#26282C}
+.wm{font-weight:600;font-size:15.5px;letter-spacing:-.01em;color:#F0F0EC}
+.scr{font-size:10.5px;letter-spacing:.2em;text-transform:uppercase;font-weight:600;color:#8D9096}
+.sp{flex:1}.read{font-size:12px;color:#9DA1A8}
+.prim{background:#5B93D8;color:#12161C;padding:6px 13px;font-size:12px;font-weight:600}
+.isol{margin-left:22px}
+.tog{border:1px solid #3A3D43;padding:5px 11px;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;font-weight:600;color:#B7BAC0}
+.path{height:40px;flex:none;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid #33353A;background:#1F2124}
+.crumb{font-size:13.5px}.crumb b{font-weight:600;color:#F0F0EC}.crumb i{font-style:normal;color:#6C7076;padding:0 7px}
+.hist{border:1px solid #3A3D43;padding:4px 10px;font-size:11.5px;color:#A9ADB4}
+.hist:hover{border-color:#5B93D8;color:#5B93D8}
+.find{margin-left:auto;width:200px;border:1px solid #3A3D43;background:#1B1C1F;padding:6px 10px;font-size:12px;color:#DCDCD8}
+.find::placeholder{color:#6C7076}
+.stats{height:58px;flex:none;display:flex;align-items:center;padding:0 16px;border-bottom:1px solid #33353A;background:#1F2124}
+.st{padding:0 24px;border-right:1px solid #33353A}.st:first-child{padding-left:0}.st:last-child{border:0}
+.v{font-size:19px;font-weight:500}
+.k{display:block;margin-top:5px;font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;color:#8D9096;font-weight:600}
+.stage{flex:1;min-height:0;display:flex;padding:12px;gap:12px}
+.field{position:relative;flex:1;min-width:0;border:1px solid #33353A;background:#1F2124;overflow:hidden}
+.t{position:absolute;border:1px solid #33353A;padding:8px 9px;overflow:hidden}
+.t .n{display:block;font-size:12.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#E6E6E2}
+.t .s{display:block;margin-top:4px;font-size:11px;font-weight:500;color:#9DA1A8;white-space:nowrap}
+.t.sm{padding:5px 6px}.t.sm .n{font-size:11px}.t.sm .s{font-size:10px;margin-top:2px}
+.t.xs{padding:0}
+.t.on{outline:1.5px solid #5B93D8;outline-offset:-1.5px}
+.rail{width:340px;flex:none;border:1px solid #33353A;background:#1F2124;display:flex;flex-direction:column;min-height:0}
+.rh{display:flex;align-items:baseline;padding:12px 14px 9px;border-bottom:1px solid #33353A}
+.rh h2{margin:0;font-size:11px;font-weight:600;letter-spacing:.18em;text-transform:uppercase;color:#A9ADB4}
+.rh span{margin-left:auto;font-size:11px;color:#7F838A}
+.tabs{display:flex;margin:10px 14px;border:1px solid #3A3D43}
+.tabs button{flex:1;padding:6px 0;font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;font-weight:600;color:#8D9096}
+.tabs button.on{background:#2E3136;color:#F0F0EC}
+.rows{flex:1;min-height:0;padding:0 8px}
+.r{display:grid;grid-template-columns:1fr 66px 46px;gap:8px;align-items:center;padding:8px 6px;border-bottom:1px solid #2A2C30;font-size:12.5px}
+.r .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sz,.pc{text-align:right;font-size:11.5px;font-weight:500;color:#9DA1A8}
+.r.sel{background:rgba(91,147,216,.1);border-left:2px solid #5B93D8;padding-left:4px}
+.r.sel .pc{color:#5B93D8}
+.picked{margin:10px 14px 0;padding:9px 11px;border:1px solid rgba(91,147,216,.5);background:rgba(91,147,216,.09)}
+.picked b{display:block;font-size:11.5px;font-weight:600;color:#5B93D8}
+.picked i{display:block;margin-top:3px;font-style:normal;font-size:11.5px;color:#A9ADB4}
+.foot{margin-top:auto;height:38px;flex:none;display:flex;align-items:center;padding:0 14px;border-top:1px solid #33353A;font-size:11px;color:#7F838A}
+.legend{height:40px;flex:none;display:flex;align-items:center;gap:16px;padding:0 16px;border-top:1px solid #33353A;background:#1F2124}
+.c{display:flex;align-items:center;gap:6px;font-size:11.5px;color:#A9ADB4}
+.sw{width:11px;height:11px;border:1px solid #4A4D53;display:block}
+.c em{font-style:normal;font-family:"Spline Sans Mono",monospace;font-size:10.5px;color:#7F838A}
+</style>
+</head>
+<body>
+<header class="bar">
+  <span class="wm">space</span><span class="scr">Explorer</span><span class="sp"></span>
+  <span class="read mono">8.31 GB · 413 files</span><button class="prim">Scan folder</button><button class="tog isol">Dark</button>
+</header>
+<nav class="path">
+  <button class="hist">← Volumes</button>
+  <span class="crumb"><i>\</i>D:<i>›</i><b>DC FRIENDS</b></span>
+  <input class="find" placeholder="Filter contents…">
+</nav>
+<div class="stats">
+  <div class="st"><span class="v">40.9 MB</span><span class="k">Folder size</span></div>
+  <div class="st"><span class="v">56</span><span class="k">Files</span></div>
+  <div class="st"><span class="v">9 / 9</span><span class="k">Items</span></div>
+  <div class="st"><span class="v">0.5%</span><span class="k">of volume</span></div>
+</div>
+<main class="stage">
+  <section class="field">
+    <div class="t on" style="left:0;top:0;width:733px;height:692px;background:#36393E"><span class="n">RISHU</span><span class="s">28.1 MB · 69%</span></div>
+    <div class="t" style="left:733px;top:0;width:329px;height:216px;background:#3B3E43"><span class="n">SCARY</span><span class="s">3.97 MB · 9.7%</span></div>
+    <div class="t" style="left:733px;top:216px;width:329px;height:214px;background:#37414B"><span class="n">ABHINAV</span><span class="s">3.93 MB · 9.6%</span></div>
+    <div class="t sm" style="left:733px;top:430px;width:108px;height:262px;background:#3B4240"><span class="n">gautam</span><span class="s">1.62 MB</span></div>
+    <div class="t sm" style="left:841px;top:430px;width:84px;height:262px;background:#44393A"><span class="n">UK BHAI</span><span class="s">1.27 MB</span></div>
+    <div class="t sm" style="left:925px;top:430px;width:78px;height:262px;background:#374344"><span class="n">GuavaHack…</span><span class="s">1.17 MB</span></div>
+    <div class="t sm" style="left:1003px;top:430px;width:59px;height:140px;background:#40413F"><span class="n">spider</span><span class="s">467 KB</span></div>
+    <div class="t sm" style="left:1003px;top:570px;width:59px;height:108px;background:#3C3C3E"><span class="n">king_k…</span><span class="s">343 KB</span></div>
+    <div class="t xs" style="left:1003px;top:678px;width:59px;height:14px;background:#3C3C3E"></div>
+  </section>
+  <aside class="rail">
+    <div class="rh"><h2>Contents</h2><span>9 of 9</span></div>
+    <div class="tabs"><button class="on">Contents</button><button>Largest</button></div>
+    <div class="rows">
+      <div class="r sel"><span class="nm">RISHU</span><span class="sz">28.1 MB</span><span class="pc">69%</span></div>
+      <div class="r"><span class="nm">SCARY</span><span class="sz">3.97 MB</span><span class="pc">9.7%</span></div>
+      <div class="r"><span class="nm">ABHINAV</span><span class="sz">3.93 MB</span><span class="pc">9.6%</span></div>
+      <div class="r"><span class="nm">gautam</span><span class="sz">1.62 MB</span><span class="pc">4.0%</span></div>
+      <div class="r"><span class="nm">UK BHAI</span><span class="sz">1.27 MB</span><span class="pc">3.1%</span></div>
+      <div class="r"><span class="nm">GuavaHacking.png</span><span class="sz">1.17 MB</span><span class="pc">2.9%</span></div>
+      <div class="r"><span class="nm">spider</span><span class="sz">467 KB</span><span class="pc">1.1%</span></div>
+      <div class="r"><span class="nm">king_khizar</span><span class="sz">343 KB</span><span class="pc">0.8%</span></div>
+      <div class="r"><span class="nm">YGG100</span><span class="sz">52.4 KB</span><span class="pc">0.1%</span></div>
+    </div>
+    <div class="picked"><b>2 selected · 32.1 MB</b><i>RISHU · SCARY</i></div>
+    <div class="foot">Left-drag pans · Shift-drag selects · ⌘K commands</div>
+  </aside>
+</main>
+<footer class="legend">
+  <span class="c"><i class="sw" style="background:#36393E"></i>Media <em>69%</em></span>
+  <span class="c"><i class="sw" style="background:#3B3E43"></i>Documents <em>9.7%</em></span>
+  <span class="c"><i class="sw" style="background:#37414B"></i>Code <em>9.6%</em></span>
+  <span class="c"><i class="sw" style="background:#3B4240"></i>Caches <em>4%</em></span>
+  <span class="c"><i class="sw" style="background:#44393A"></i>Apps <em>3.1%</em></span>
+  <span class="c"><i class="sw" style="background:#374344"></i>Archives <em>2.9%</em></span>
+  <span class="c"><i class="sw" style="background:#40413F"></i>System <em>1.1%</em></span>
+  <span class="c"><i class="sw" style="background:#3C3C3E"></i>Other <em>1.9%</em></span>
+</footer>
+</body>
+</html>

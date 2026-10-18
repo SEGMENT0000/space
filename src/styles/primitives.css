@@ -1,0 +1,448 @@
+/* ---------------------------------------------------------------
+   Primitives — resets, typography utilities, panels, controls,
+   textures. Shared by every screen; screen-specific styles live
+   in the screen's own module (drives.css, scan.css, explorer.css, …).
+   --------------------------------------------------------------- */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--ink);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+  user-select: none;
+  cursor: default;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+  border-radius: 6px;
+}
+
+input {
+  font: inherit;
+  color: inherit;
+  caret-color: var(--accent);
+}
+
+input::placeholder {
+  color: var(--ink-3);
+}
+
+/* themed scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--hairline-strong) transparent;
+}
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--hairline-strong);
+  border-radius: 99px;
+  border: 2.5px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* --------------------------------------------------- type utilities */
+
+/* any string that can change while on screen */
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* The label voice: sentence-case Geist, quiet. Labels are structure, not
+   costume — mono is reserved for figures, paths, and code. */
+.micro {
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.005em;
+  text-transform: none;
+  color: var(--ink-2);
+  line-height: 1.3;
+}
+
+.kbd {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-3);
+  background: var(--fill-quiet);
+  border: 0.5px solid var(--hairline);
+  border-radius: 5px;
+  padding: 1.5px 5px;
+  min-width: 18px;
+  text-align: center;
+}
+
+/* --------------------------------------------------- panel
+   The app's one surface vocabulary: floating panels on the ground,
+   hairline edges, interiors divided by hairlines — never nested cards. */
+
+.panel {
+  background: var(--bg-elevated);
+  border-radius: var(--r-panel);
+  box-shadow: var(--shadow-panel), var(--panel-edge);
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* floating layer (menus, palette, hover card) */
+.float {
+  background: var(--bg-elevated);
+  border-radius: var(--r-menu);
+  box-shadow: var(--shadow-menu);
+}
+
+/* --------------------------------------------------- stat block
+   Micro-label on top, big tabular figure below. Real data only. */
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.stat .stat-v {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  font-weight: 550;
+  font-size: 21px;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+  line-height: 1.1;
+  white-space: nowrap;
+}
+.stat .stat-v .u {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-2);
+  letter-spacing: 0;
+  margin-left: 3px;
+}
+.stat .stat-sub {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.stat.is-hero .stat-v {
+  font-size: 30px;
+  font-weight: 600;
+}
+.stat.is-sm .stat-v {
+  font-size: 15px;
+}
+
+/* --------------------------------------------------- chip
+   Category / status chip: swatch + word. The Two-Channel Rule made
+   into a primitive — color never arrives alone. */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-2);
+  background: var(--fill-quiet);
+  border: 0.5px solid var(--hairline);
+  border-radius: var(--r-chip);
+  padding: 2px 8px 2px 6px;
+  white-space: nowrap;
+}
+.chip .chip-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2.5px;
+  flex: none;
+}
+
+/* --------------------------------------------------- textures
+   Meaningful fills: hatch = filtered/unavailable, dots = bed. */
+
+.tex-hatch {
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent 0 3.5px,
+    var(--hairline) 3.5px 4.5px
+  );
+}
+
+.tex-dots {
+  background-image: radial-gradient(var(--hairline) 0.75px, transparent 0.85px);
+  background-size: 6px 6px;
+}
+
+/* Crop marks: 1px L-brackets at two opposite corners of a data field.
+   Marks the boundary of an instrument region — never pure ornament. */
+.crop::before,
+.crop::after {
+  content: "";
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  pointer-events: none;
+}
+.crop::before {
+  top: 0;
+  left: 0;
+  border-top: 1px solid var(--hairline-strong);
+  border-left: 1px solid var(--hairline-strong);
+}
+.crop::after {
+  right: 0;
+  bottom: 0;
+  border-right: 1px solid var(--hairline-strong);
+  border-bottom: 1px solid var(--hairline-strong);
+}
+
+/* --------------------------------------------------- controls */
+
+.btn {
+  font: inherit;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 12px;
+  border: none;
+  border-radius: var(--r-ctl);
+  background: var(--fill-quiet);
+  color: var(--ink);
+  cursor: default;
+  transition: background 120ms var(--ease-out);
+}
+.btn:hover {
+  background: var(--fill-hover);
+}
+.btn:active {
+  background: var(--fill-active);
+}
+.btn-primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.btn-primary:hover {
+  background: color-mix(in srgb, var(--accent) 88%, black);
+}
+.btn-primary:active {
+  background: color-mix(in srgb, var(--accent) 80%, black);
+}
+.btn:disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.icon-btn {
+  font: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--ink-2);
+  cursor: default;
+  transition: background 120ms var(--ease-out), color 120ms var(--ease-out);
+}
+.icon-btn:hover {
+  background: var(--fill-hover);
+  color: var(--ink);
+}
+.icon-btn:active {
+  background: var(--fill-active);
+}
+.icon-btn:disabled {
+  opacity: 0.32;
+  pointer-events: none;
+}
+.icon-btn.is-on {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* segmented control */
+.seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 2px;
+  border-radius: var(--r-ctl);
+  background: var(--fill-quiet);
+}
+.seg-item {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  border: none;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: default;
+  transition: background 120ms var(--ease-out), color 120ms var(--ease-out);
+  white-space: nowrap;
+}
+.seg-item:hover {
+  color: var(--ink);
+}
+.seg-item[aria-pressed="true"] {
+  background: var(--bg-elevated);
+  color: var(--ink);
+  box-shadow: 0 0 0 0.5px var(--hairline), 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+/* --------------------------------------------------- hover card
+   One readout for the whole app: the complete truth of whatever the
+   pointer is over — treemap tile or rail row. Correct item, always. */
+
+.hovercard {
+  position: absolute;
+  z-index: 40;
+  min-width: 190px;
+  max-width: 320px;
+  padding: 10px 12px 8px;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(2px);
+  transition: opacity 120ms var(--ease-out), transform 120ms var(--ease-out);
+}
+.hovercard.is-live {
+  opacity: 1;
+  transform: none;
+}
+/* interactive variant: floats beside a DOM row; pointer lands on it and
+   its actions are real. Owners keep it alive with a short leave-grace. */
+.hovercard.is-interactive {
+  pointer-events: auto;
+}
+.hovercard .hc-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hovercard .hc-figures {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 4px;
+}
+.hovercard .hc-size {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.hovercard .hc-share {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.hovercard .hc-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.hovercard .hc-path {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+.hovercard .hc-actions {
+  display: flex;
+  gap: 2px;
+  margin: 6px -12px -8px;
+  padding: 4px 10px 2px;
+  border-top: 0.5px solid var(--hairline);
+}
+
+/* --------------------------------------------------- app shell */
+
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.screen {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* entry fade used for screen transitions */
+.fade-in {
+  animation: fade-in 260ms var(--ease-out) both;
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

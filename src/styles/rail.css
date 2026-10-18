@@ -1,0 +1,393 @@
+/* ---------------------------------------------------------------
+   Rail — the inspector (ExplorerRail.tsx). In the pinned panel world
+   this is a floating panel of its own: elevated surface on the ground,
+   --r-panel radius, hairline ring + soft edge (--shadow-panel /
+   --panel-edge carry the panel language; the values are the .panel
+   primitive's own, restated here because .panel's overflow:hidden would
+   clip the rail's interactive hover card — see the offsetParent note).
+   Interiors are hairline-stacked sections at 14px 16px; the ONLY scroll
+   region is the largest-files list, so the hero figure and the toggles
+   never leave view. Type register: labels are sentence-case Geist —
+   mono tabular (.num) is for figures and paths only. No cards-in-cards,
+   no resting shadows, no gradients, no uppercase-mono labels.
+   --------------------------------------------------------------- */
+
+.rail {
+  position: relative; /* HoverCard's offsetParent: the card floats inside the
+                         rail and may poke past its rounded edge — overflow
+                         must stay visible, so .rail never scrolls. The list
+                         below owns the only scrollbar. */
+  flex: none;
+  width: 300px;
+  min-width: 300px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: visible;
+  background: var(--bg-elevated);
+  border-radius: var(--r-panel);
+  box-shadow: var(--shadow-panel), var(--panel-edge);
+}
+
+/* Long names may not escape the rail box: with the width clamped here, the
+   card's own hc-name/hc-path ellipsis engage and a maxed-out hovercard reads
+   as a rail-width instrument instead of a pane-bisecting strip. */
+.rail .hovercard {
+  max-width: calc(100% - 16px);
+}
+
+/* Narrow windows: the rail floats OVER the map as a panel, inset on every
+   edge — the overlay-rail shadow from the vocabulary, minus the in-flow
+   layout question entirely. */
+@media (max-width: 900px) {
+  .rail {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 6;
+    margin: 10px;
+    box-shadow: -12px 0 32px rgba(0, 0, 0, 0.28), var(--shadow-panel),
+      var(--panel-edge);
+  }
+}
+
+/* Sections meet at 1px hairlines, like cells of one panel — never cards. */
+.rail-sec {
+  flex: none;
+  min-width: 0;
+  padding: 14px 16px;
+}
+.rail-sec + .rail-sec {
+  border-top: 1px solid var(--hairline);
+}
+
+/* The list section grows and owns the rail's only scroll region; the fixed
+   sections never yield height, so the readout holds steady while the list
+   scrolls beneath it. */
+.rail-files {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 10px;
+}
+
+/* Section titles are sentence-case Geist, not tracked mono-caps: the label
+   names the group; the mono figure on the right carries the value. */
+.rail-title {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-2);
+  margin: 0 0 10px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+/* "30 of 30": the count is a live figure — the numerals are .num (tabular
+   mono), the connecting word inherits Geist at 11px so the title never
+   shifts while the filter rewrites it. */
+.rail-title .count {
+  color: var(--ink-2);
+  font-weight: 500;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------- selection readout */
+
+/* The readout rides the shared .stat block (label-above-figure rhythm, gap
+   3); .is-hero is the display step. 34px clears a "1.05 TB"-worst-case line
+   inside this panel's 300px minus section padding (~268px) with room for
+   the unit — measured, not guessed. */
+.rail .stat.is-hero .stat-v {
+  font-size: 34px;
+}
+.rail .stat p {
+  margin: 0; /* flex-column rhythm comes from .stat's gap, not <p> margins */
+}
+
+/* Quiet sentence-case line naming the readout mode (Selection / 3 items
+   selected / Current folder) — Geist 12px 500 ink-2, one step below the
+   name, never mono-caps. */
+.sel-label {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.3;
+  letter-spacing: 0.005em;
+  color: var(--ink-2);
+}
+/* The item name: title step, ellipsized — the readout is fixed-height, so
+   it clips rather than reflows. */
+.sel-name {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Sub-line words are Geist; figures inside are .num (mono tabular), so the
+   numbers stay steady across selection changes without a mono voice on the
+   whole line. */
+.sel-sub {
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Category chip row — the shared .chip primitive (dot + word). */
+.sel-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+/* Path: mono 10.5 ink-3, one line, tail-true via ellipsizePath() in the
+   component (head+tail kept, ellipsis in the middle); CSS ellipsis is the
+   backstop for extreme widths. */
+.sel-path {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Readout actions share the rows' icon-button voice (28px squares); no
+   native tooltips — accessible names come from aria-label. */
+.sel-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+/* --------------------------------------------------- composition */
+
+.cat-row {
+  display: block;
+  width: 100%;
+  border: none;
+  background: transparent;
+  font: inherit;
+  color: var(--ink);
+  text-align: left;
+  padding: 2px 8px;
+  margin: 0 -8px;
+  border-radius: var(--r-row);
+  cursor: default;
+  transition: background 120ms var(--ease-out);
+}
+.cat-row:hover {
+  background: var(--fill-hover);
+}
+
+.cat-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Chip-style swatch: rounded square, one per category. Caches repeats the
+   treemap hatch (::after); a filtered row's swatch wears the tex-hatch
+   (::before) — two hatches, different jobs, never color alone. */
+.cat-swatch {
+  position: relative;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex: none;
+}
+.cat-swatch.is-hatch::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 3px;
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent 0 2px,
+    rgba(0, 0, 0, 0.4) 2px 3px
+  );
+}
+/* Filtered: hatch over the swatch + ink-3 label below — the filtered state
+   is a texture-and-text reading, exactly the Two-Channel Rule. */
+.cat-row.is-off .cat-swatch::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 3px;
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent 0 2px,
+    var(--ink-3) 2px 3px
+  );
+}
+
+.cat-lbl {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cat-row.is-off .cat-lbl {
+  color: var(--ink-3);
+}
+/* Figures: mono tabular via .num; a fixed minimum keeps the pct column on
+   one axis down the list. */
+.cat-size {
+  font-size: 11px;
+  color: var(--ink-2);
+  min-width: 52px;
+  text-align: right;
+  white-space: nowrap;
+}
+.cat-pct {
+  font-size: 11px;
+  color: var(--ink-3);
+  min-width: 38px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* The 4px share bar: real percentages on a dot-matrix bed — proportions
+   read at a glance without holding every figure in mind. */
+.cat-bar {
+  position: relative;
+  display: block;
+  height: 4px;
+  margin-top: 3px;
+  border-radius: 2px;
+  overflow: hidden;
+}
+.cat-bar-fill {
+  position: relative;
+  z-index: 1;
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  transition: width 200ms var(--ease-out);
+}
+.cat-row.is-off .cat-bar-fill {
+  opacity: 0.3;
+}
+
+/* --------------------------------------------------- largest files */
+
+.file-row {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) 62px;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--ink);
+  text-align: left;
+  padding: 0 8px;
+  margin: 0 -8px;
+  border-radius: var(--r-row);
+  cursor: default;
+  transition: background 120ms var(--ease-out);
+}
+/* Hover is one fill step (120ms state curve); selection keeps the rationed
+   accent tint — the only blue-family voice allowed in chrome. */
+.file-row:hover {
+  background: var(--fill-hover);
+}
+.file-row.is-sel {
+  background: var(--accent-soft);
+}
+.file-ico {
+  color: var(--ink-3);
+  display: flex;
+  justify-content: center;
+}
+.file-nm {
+  line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The size axis: fixed shared column, mono tabular figures right-aligned —
+   every row's number compares on the same baseline. */
+.file-sz {
+  color: var(--ink-2);
+  font-size: 11px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Empty states are messages, not annotations — ink-2 clears 4.5:1. */
+.rail-empty {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--ink-2);
+  margin: 2px 0;
+  padding: 1px 8px 3px;
+}
+
+/* Filter field reuses the toolbar search language, scaled to the rail:
+   26px, sunken fill, control radius; focus = elevated fill + the system's
+   2.5px ring at a 0.5px hairline core. */
+.rail-search {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  width: 100%;
+  padding: 0 8px;
+  margin: 0 0 8px;
+  border-radius: var(--r-ctl);
+  background: var(--fill-quiet);
+  color: var(--ink-3);
+  transition: background 120ms var(--ease-out);
+}
+.rail-search:focus-within {
+  background: var(--bg-elevated);
+  box-shadow: 0 0 0 0.5px var(--hairline-strong), 0 0 0 2.5px var(--focus);
+}
+.rail-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  /* The wrapper's ink-3 colors the glyph only; typed text must hold the
+     ink step or the query reads as a placeholder. */
+  color: var(--ink);
+  font-size: 12px;
+  font-family: var(--font-sans);
+}
+
+/* The list: the rail's ONLY scroll region. scrollbar-gutter keeps the row
+   width fixed across the scrollbar's appear/disappear while the filter
+   rewrites it; overscroll containment keeps an exhausted list from
+   scrolling the whole panel. Full-bleed rows via the -8px mirror of the
+   row padding. No radius here on purpose: rounding this scroll box would
+   shave the hovered fill's corners of the topmost visible row, mid-panel. */
+.rail-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  margin: 0 -8px;
+  padding: 0 8px 4px;
+}

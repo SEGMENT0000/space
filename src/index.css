@@ -1,0 +1,15 @@
+/* ---------------------------------------------------------------
+   Space — design system entry point.
+   Import order is the cascade: tokens → shared primitives →
+   per-surface modules. Each surface owns exactly one module;
+   a class is defined in exactly one file.
+   --------------------------------------------------------------- */
+
+@import "./styles/tokens.css";
+@import "./styles/primitives.css";
+@import "./styles/shell.css";
+@import "./styles/drives.css";
+@import "./styles/scan.css";
+@import "./styles/explorer.css";
+@import "./styles/rail.css";
+@import "./styles/map.css";

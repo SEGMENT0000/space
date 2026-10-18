@@ -1,0 +1,571 @@
+/* ---------------------------------------------------------------
+   Preview plates — the in-tile instrument panels (INS_BRIEF.md §2).
+   Sibling overlay of `.map-labels` / `.map-instruments`: position +
+   content are written imperatively from the draw loop, never through
+   React, so nothing here enters the render path.
+
+   World: every plate is one small instrument mounted on the tile fill —
+   a deep sunken chassis (plate edge + head strip) carrying an elevated
+   readout bed (text / list / meta) or a sunken content bed (hex / image
+   / media). Radius comes from --r-plate; every divider is a hairline;
+   no gradient, no glass, no glow, no resting shadow (§4); nothing here
+   scrolls and nothing takes pointer events (map gestures win,
+   integrator note 1). Both themes resolve entirely through tokens.css
+   vars; readable ≤11px text rides --ink-2 (≥4.5:1 on the elevated beds,
+   ≈4.5:1 on the sunken chassis) with weight, not colour, for hierarchy.
+   --------------------------------------------------------------- */
+
+/* Layer div the renderer creates. pointer-events:none so map pan
+   (left-drag, the primary gesture) always wins — integrator note 1.
+   overflow:hidden is load-bearing: plates are positioned in tile
+   coordinates, so a tile panned/zoomed past the map edge would send its
+   plate over the rail/statusbar without this clip (matches the canvas,
+   which clips tiles at its own bounds). */
+.map-previews {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.tm-prev {
+  /* left/top + --tile-w/--tile-h come from the draw loop's CANVAS-VISIBLE
+     tile rect (the tile ∩ canvas box, inset 4px on tile sides that are on
+     canvas; the calc below subtracts that 8px back out). Set inline per
+     plate, or inherited from the layer — the fallbacks keep the calc
+     valid before the first write and clamp to 0px, so an unfilled pool
+     node is invisible. */
+  position: absolute;
+  inset-block-start: 4px;
+  inset-inline-start: 4px;
+  width: calc(var(--tile-w, 0px) - 8px);
+  height: calc(var(--tile-h, 0px) - 8px);
+  display: flex;
+  flex-direction: column;
+  /* deep chassis: the plate reads as an instrument mounted on the tile
+     fill — the families' own beds layer on top of it */
+  background: var(--bg-sunken);
+  border: 0.5px solid var(--hairline-strong);
+  border-radius: var(--r-plate);
+  box-shadow: none; /* §4.2: plates never rest on a shadow */
+  overflow: hidden;
+  pointer-events: none; /* map gestures always win */
+}
+/* pooled nodes ship hidden; reveal via `hidden=false` (inline display
+   also wins, so either toggle convention the renderer picks works) */
+.tm-prev[hidden] {
+  display: none;
+}
+
+.tm-prev__head {
+  flex: none;
+  height: 22px; /* 28px at tile-w ≥ 320 — data-head written by fillPlate */
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--hairline);
+}
+.tm-prev[data-head="lg"] .tm-prev__head {
+  height: 28px;
+}
+.tm-prev__name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.tm-prev__meta {
+  margin-left: auto;
+  flex: none;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.tm-prev__body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: hidden; /* static plate: clip, never scroll (§4.7) */
+}
+
+/* --------------------------------------------------- shared footer
+   16px truncation band (§2.0 — TEXT/LIST/META all reserve exactly this
+   in their line math), block + text-align so the "… " run keeps its
+   space (flex would trim it as an anonymous item). Count rides in
+   `.num` (mono tabular); the `+` suffix (written by TS) marks a
+   payload-declared lower bound. */
+.tm-text__more,
+.tm-list__more,
+.tm-meta__more {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 16px;
+  line-height: 16px;
+  padding: 0 8px;
+  text-align: right;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--ink-2);
+  background: var(--fill-quiet);
+  border-top: 1px solid var(--hairline);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* --------------------------------------------------- TEXT (§2.1)
+   Elevated readout bed on the sunken chassis. Greyscale syntax only —
+   three ink steps + weight, never colour (§4.6): comments and numeric
+   literals --ink-2, keywords/directives --ink at 600, blanks --ink-3
+   (they render no glyphs, so the ink-3 step stays informational). */
+.tm-text {
+  background: var(--bg-elevated);
+}
+.tm-text__grid {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  display: grid;
+  /* mono/11 declared here so the `1ch` in the gutter-track calc measures
+     a mono digit — the 10.5px numbers then always fit their track. */
+  font-family: var(--font-mono);
+  font-size: 11px;
+  /* [gutter] auto · [rule] 1px · [code] 1fr — the rule is the code
+     cell's border-left: one fewer empty cell per line, same line
+     weight and position as a dedicated track. */
+  grid-template-columns: calc(max(3, var(--ln-d, 3)) * 1ch + 14px) minmax(0, 1fr);
+  grid-auto-rows: 16px; /* every line occupies exactly one row */
+  align-content: start;
+}
+.tm-text__ln {
+  height: 16px;
+  line-height: 16px;
+  background: var(--fill-quiet);
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  padding-right: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.tm-text__code {
+  height: 16px;
+  line-height: 16px;
+  border-left: 1px solid var(--hairline);
+  padding: 0 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500; /* keywords step to 600 below; dark drops the base to 400 */
+  color: var(--ink);
+  white-space: pre;
+  overflow: hidden;
+  tab-size: 4; /* one tab = 4 cols keeps indentation readable at 11px */
+}
+.tm-text__code.is-comment {
+  color: var(--ink-2);
+}
+.tm-text__code.is-key {
+  font-weight: 600; /* the keyword channel is weight on the same ink */
+}
+.tm-text__code.is-literal {
+  color: var(--ink-2);
+}
+.tm-text__code.is-blank {
+  color: var(--ink-3); /* no glyphs — informational only */
+}
+
+/* --------------------------------------------------- HEX (§2.1)
+   Sunken bed — the same tone as the chassis: the dump IS the
+   instrument's deep display. Offsets/bytes/ascii all read --ink-2 mono
+   11/16; ONE 1px hairline separates hex from ascii (the ascii cell's
+   border-left — stacked rows make it read continuous). */
+.tm-hex {
+  background: var(--bg-sunken);
+  padding: 8px;
+}
+.tm-hex__row {
+  display: flex;
+  align-items: baseline;
+  height: 16px;
+  line-height: 16px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500; /* bytes inherit; off/ascii step down to 400 below */
+  color: var(--ink-2);
+  white-space: pre;
+  overflow: hidden;
+}
+.tm-hex__off {
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 400;
+  margin-right: 2ch;
+}
+.tm-hex__bytes {
+  display: flex;
+  flex: none;
+}
+.tm-hex__b {
+  margin-right: 1ch; /* one mono space between bytes */
+}
+.tm-hex__b:nth-child(8n):not(:last-child) {
+  margin-right: 3ch; /* §2.1: extra 2ch gap every 8 bytes */
+}
+/* confirmed signature hit only — the one accent spend in HEX */
+.tm-hex__b.is-sig {
+  background: var(--accent-soft);
+  border-bottom: 0.5px solid var(--accent);
+}
+.tm-hex__ascii {
+  flex: none;
+  border-left: 1px solid var(--hairline);
+  margin-left: 6px;
+  padding-left: 6px;
+  font-weight: 400;
+}
+/* the signature's text key (Two-Channel) rides the row's right margin;
+   TS cuts it whole when the dump outruns the plate — never clipped
+   mid-glyph. Elevated chip bed lifts the accent off the sunken dump. */
+.tm-hex__note {
+  flex: none;
+  align-self: center;
+  margin-left: auto;
+  height: 14px;
+  line-height: 14px;
+  padding: 0 6px;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--accent);
+  background: var(--bg-elevated);
+  border: 0.5px solid var(--hairline);
+  border-radius: var(--r-chip);
+}
+
+/* --------------------------------------------------- IMAGE (§2.2)
+   Flat sunken letterbox bed (permitted — the ban is on the treemap
+   itself letterboxing). The 1px strong frame hugs the img box; crop
+   marks + dim tab only at tile-w ≥ 160 (written by TS); no scrim, no
+   blended fill, no radius, no shadow, no hover zoom in this family. */
+.tm-img {
+  background: var(--bg-sunken);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+}
+.tm-img__frame {
+  position: relative;
+  display: block;
+  line-height: 0; /* kill the inline strut so the frame hugs the img */
+  max-width: 100%;
+  max-height: 100%;
+  border: 1px solid var(--hairline-strong);
+}
+/* .crop (primitives) draws the two 9px L-brackets TL+BR — applied by
+   TS only when tile-w ≥ 160 (below that, frame only) */
+.tm-img__el {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain; /* never crop, even if DTO dims lie */
+  width: auto;
+  height: auto;
+}
+/* pixel dimensions tab, butted into the frame's bottom-right corner */
+.tm-img__dim {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 14px;
+  color: var(--ink-2);
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--hairline);
+  border-left: 1px solid var(--hairline);
+  padding: 0 5px;
+  white-space: nowrap;
+}
+
+/* in-family unavailable state (failed image decode / desktop-only
+   media): keyed hatch over the sunken bed + centred words + the real
+   reason — the head strip stays, so the file is still labelled.
+   background-COLOR longhand so it coexists with the tex-hatch image. */
+.tm-failed {
+  background-color: var(--bg-sunken);
+}
+
+/* --------------------------------------------------- LIST (§2.3)
+   `--cols` is written per payload by TS (archive `1fr 5ch 7ch`,
+   db `1fr 7ch 7ch`, generic `1fr 7ch`). Rows are clipped by the
+   rows box — a scrollbar inside a tile is a defect. */
+.tm-list {
+  background: var(--bg-elevated);
+  display: flex;
+  flex-direction: column;
+}
+.tm-list__keys {
+  flex: none;
+  height: 16px;
+  display: grid;
+  grid-template-columns: var(--cols, 1fr);
+  gap: 8px;
+  padding: 0 8px;
+  align-items: center;
+  background: var(--fill-quiet);
+}
+.tm-list__key {
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 500;
+  /* --ink-2, not the literal --ink-3: at 10.5px ink-3 is far below the
+     4.5 floor; ink-2 clears it on this bed */
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tm-list__key.is-num {
+  text-align: right; /* numeric keys sit over their values */
+}
+.tm-list__rows {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.tm-list__row {
+  display: grid;
+  grid-template-columns: var(--cols, 1fr);
+  gap: 8px;
+  height: 22px;
+  padding: 0 8px;
+  align-items: center;
+  border-bottom: 1px solid var(--hairline);
+  transition: background 120ms var(--ease-out); /* only motion allowed */
+}
+/* inert while pointer-events:none (integrator note 1) — kept for the
+   hover-capable future; one fill step, 120ms, no halo/scale/shadow */
+.tm-list__row:hover {
+  background: var(--fill-hover);
+}
+.tm-list__name {
+  min-width: 0;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tm-list__val {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--ink-2);
+  text-align: right;
+  white-space: nowrap; /* rows never wrap; the 7ch track fits formatBytes' widest output */
+}
+
+/* --------------------------------------------------- META (§2.4)
+   TARGET INSPECTOR pattern: padded readout, ONE capped hero `.stat`,
+   kv rows carved by hairlines, optional rotated edge rail carrying a
+   single live datum. No invented section titles — the DTO hands us
+   flat pairs, so structure comes from dividers only. */
+.tm-meta {
+  /* this class rides on the body element itself (a flex child of the
+     plate) — it must NOT escape to absolute positioning or it would
+     cover the header strip */
+  background: var(--bg-elevated);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px; /* .stat rhythm between sections */
+  overflow: hidden;
+}
+.tm-meta--rail {
+  /* the 20px rail hugs the right edge; content and the footer inset to
+     clear it (rail 20px + the 8px pad it replaces) */
+  padding-right: 28px;
+}
+.tm-meta__sect + .tm-meta__sect {
+  border-top: 1px solid var(--hairline);
+  padding-top: 8px; /* hairline + 8px carve between sections */
+}
+.tm-meta__kv {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr); /* 72px: real keys like "original size" fit */
+  column-gap: 8px;
+  height: 18px;
+  align-items: center;
+}
+.tm-meta__k {
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--ink-2); /* keys stay quiet; dark uses ink-2 too (§2.4) */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tm-meta__v {
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tm-meta__v.is-num {
+  text-align: right; /* numbers to the common axis; strings/paths left */
+}
+.tm-meta__v.tm-warn {
+  color: var(--warn); /* text only, never a row tint (§2.4) */
+}
+.tm-prev .tm-meta__flag {
+  /* .kbd supplies geometry (mono 10.5, 0.5px hairline, radius 5);
+     this corrects its --ink-3 colour: 10.5px chips need the 4.5 floor.
+     Scoped under .tm-prev + raised specificity so load order against
+     primitives.css can never flip it back to ink-3. */
+  color: var(--ink-2);
+}
+.tm-meta__swatch {
+  display: inline-block;
+  width: 12px;
+  height: 8px;
+  margin-right: 4px;
+  border: 0.5px solid var(--hairline); /* keyed swatch edge, R6/R9 */
+  vertical-align: middle;
+}
+/* right-edge rail (§2.4): tile-w ≥ 360 AND tile-h ≥ 240, ONE live
+   datum, rotated −90° (reads bottom→top), cut whole when it doesn't
+   fit exactly — TS measures and removes; never clipped mid-glyph */
+.tm-meta__rail {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 20px;
+  border-left: 1px solid var(--hairline);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.tm-meta__rail-text {
+  writing-mode: vertical-rl; /* inline axis = vertical; rotate(180) = −90° */
+  transform: rotate(180deg);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 9.5px; /* §4.7: the 9.5px floor, never below */
+  font-weight: 500;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.tm-meta--rail .tm-meta__more {
+  right: 28px; /* clear the rail band */
+}
+
+/* --------------------------------------------------- MEDIA
+   Inert instrument plate: the binding law gives plates no pointer
+   events, so there are no native transport controls — video shows its
+   real first frame (framed like IMAGE), audio gets a centred stat; the
+   one datum either way is the file's real duration (formatElapsed). */
+.tm-media {
+  background: var(--bg-sunken);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+}
+.tm-media__el {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border: 1px solid var(--hairline-strong);
+}
+.tm-media__src {
+  display: none; /* audio loader: metadata only, no visuals */
+}
+.tm-media__stamp {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  height: 16px;
+  line-height: 16px;
+  padding: 0 6px;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--ink-2);
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--hairline);
+  border-left: 1px solid var(--hairline);
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------- shared stack
+   Centred column for the plate's word-mark states: fallback (§2.0/§3),
+   in-family unavailable, audio readout. */
+.tm-stack {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px;
+  text-align: center;
+}
+.tm-stack__note {
+  font-size: 10.5px;
+  color: var(--ink-2);
+}
+
+/* --------------------------------------------------- fallback (§2.0/§3)
+   Honest unavailable state: dots bed over the whole plate (the head
+   strip is dropped — there is no content to label), keyed hatch
+   swatch + sentence-case words + the real reason as a figure. */
+.tm-prev--fallback .tm-prev__head {
+  display: none;
+}
+.tm-fallback__swatch {
+  width: 12px;
+  height: 8px;
+  border: 0.5px solid var(--hairline);
+}
+
+/* --------------------------------------------------- dark theme
+   Only type weights differ by theme — every colour already resolves
+   through tokens.css vars that exist in both blocks. Dark body mono
+   drops to 400 (§2.1) so 11px glyphs don't bloom on the sunken bed;
+   the keyword channel keeps its 600. */
+.tm-prev[data-theme="dark"] .tm-text__code,
+.tm-prev[data-theme="dark"] .tm-hex__off,
+.tm-prev[data-theme="dark"] .tm-hex__b,
+.tm-prev[data-theme="dark"] .tm-hex__ascii {
+  font-weight: 400;
+}
+.tm-prev[data-theme="dark"] .tm-text__code.is-key {
+  font-weight: 600;
+}

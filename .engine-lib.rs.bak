@@ -1,0 +1,90 @@
+//! Backend commands of the `space` disk-space analyzer.
+//!
+//! Active engine: `engine.rs` (correct, single-threaded).
+//! `scanner.rs` is a parallel-engine rewrite staged by a workstream and is
+//! intentionally not wired in until it compiles cleanly.
+
+mod classify;
+mod drives;
+mod engine;
+mod model;
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tauri::State;
+
+/// Lists the available disks.
+#[tauri::command]
+fn list_drives() -> Vec<model::DriveInfo> {
+    drives::list_drives()
+}
+
+/// Starts a scan of `root`, running on a worker thread.
+#[tauri::command]
+fn start_scan(
+    app: tauri::AppHandle,
+    engine: State<'_, Arc<engine::Engine>>,
+    root: String,
+) -> Result<(), String> {
+    engine::start_scan(app, engine.inner().clone(), root)
+}
+
+/// Cancels the running scan, if any.
+#[tauri::command]
+fn cancel_scan(engine: State<'_, Arc<engine::Engine>>) {
+    engine.cancel.store(true, Ordering::Relaxed);
+}
+
+/// Children of a node, one level deep (and one deeper with `depth`).
+#[tauri::command]
+fn get_children(
+    engine: State<'_, Arc<engine::Engine>>,
+    node_id: u32,
+    depth: u32,
+    sort: String,
+    limit: u32,
+) -> Result<model::ChildrenResponse, String> {
+    engine::get_children(engine.inner(), node_id, depth, &sort, limit)
+}
+
+/// The largest files of the finished scan.
+#[tauri::command]
+fn get_largest_files(
+    engine: State<'_, Arc<engine::Engine>>,
+    limit: u32,
+) -> Result<Vec<model::LargestFile>, String> {
+    engine::get_largest_files(engine.inner(), limit)
+}
+
+/// Per-category byte totals of a node's subtree.
+#[tauri::command]
+fn get_category_totals(
+    engine: State<'_, Arc<engine::Engine>>,
+    node_id: u32,
+) -> Result<Vec<u64>, String> {
+    engine::get_category_totals(engine.inner(), node_id)
+}
+
+/// Snapshot of the engine state, for UI recovery.
+#[tauri::command]
+fn scan_state(engine: State<'_, Arc<engine::Engine>>) -> model::ScanStateDto {
+    engine::scan_state(engine.inner())
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .manage(Arc::new(engine::Engine::new()))
+        .invoke_handler(tauri::generate_handler![
+            list_drives,
+            start_scan,
+            cancel_scan,
+            get_children,
+            get_largest_files,
+            get_category_totals,
+            scan_state
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

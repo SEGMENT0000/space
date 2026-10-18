@@ -1,0 +1,123 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-17T02:00:00Z",
+  "title": "Design System: space",
+  "extensions": {
+    "colorMeta": {
+      "accent": { "role": "primary", "displayName": "Selection Blue", "canonical": "#0a66e0", "tonalRamp": ["#0a2a5e", "#0a3d87", "#0a52b3", "#0a66e0", "#3d8bff", "#77b2ff", "#a8cdff", "#d7e8ff"] },
+      "bg-light": { "role": "neutral", "displayName": "Cool Ground (light)", "canonical": "#f5f5f7", "tonalRamp": ["#1d1d1f", "#3a3a3e", "#6b6b70", "#9d9da3", "#c8c8cd", "#e4e4e8", "#f5f5f7", "#fbfbfc"] },
+      "bg-dark": { "role": "neutral", "displayName": "Cool Ground (dark)", "canonical": "#161618", "tonalRamp": ["#101012", "#161618", "#1f1f22", "#2c2c30", "#4a4a4f", "#77777d", "#b6b6bc", "#f2f2f4"] },
+      "cat-media-light": { "role": "data", "displayName": "Media Blue", "canonical": "#3d7fdd", "tonalRamp": ["#0e2a52", "#123a6b", "#1f56a3", "#2e6cc4", "#3d7fdd", "#6ba0e8", "#a3c4f2", "#d8e6fa"] },
+      "cat-caches-light": { "role": "data", "displayName": "Caches Amber (hatched)", "canonical": "#d2952c", "tonalRamp": ["#3d2a08", "#6b4a10", "#9c6d1a", "#b88022", "#d2952c", "#e0af5e", "#ebcb92", "#f6e6cb"] },
+      "cat-system-light": { "role": "data", "displayName": "System Violet", "canonical": "#8a6fc0", "tonalRamp": ["#241a3d", "#3d3063", "#5a4a8e", "#725ca8", "#8a6fc0", "#a790d1", "#c4b5e2", "#e2d9f1"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display figure", "purpose": "Volume size and selection size only; the one large type moment." },
+      "figure": { "displayName": "Tabular figure", "purpose": "Every live number, path, and shortcut; Geist Mono with tnum." },
+      "tile-label": { "displayName": "Tile label", "purpose": "Treemap overlay; 600 11.5px big / 500 10.5px small, always clipped to its tile." }
+    },
+    "shadows": [
+      { "name": "floating-layer", "value": "0 10px 34px rgba(0,0,0,0.16), 0 0 0 0.5px rgba(0,0,0,0.1)", "purpose": "Context menus and command palette (light); dark uses 0 12px 36px rgba(0,0,0,0.5) + light hairline." },
+      { "name": "overlay-rail", "value": "-12px 0 32px rgba(0,0,0,0.28)", "purpose": "Inspector rail when it floats over the map below 900px viewport width." },
+      { "name": "segmented-active", "value": "0 0 0 0.5px var(--hairline), 0 1px 2px rgba(0,0,0,0.07)", "purpose": "Pressed segment lift in segmented controls." }
+    ],
+    "motion": [
+      { "name": "ease-spring", "value": "cubic-bezier(0.32, 0.72, 0, 1)", "purpose": "The one curve that moves: 420ms treemap zoom/pan navigation, usage-bar fill." },
+      { "name": "ease-out", "value": "cubic-bezier(0.22, 0.9, 0.3, 1)", "purpose": "State transitions: hover fills, focus rings, fades; 120ms default." }
+    ],
+    "breakpoints": [
+      { "name": "rail-overlay", "value": "900px" },
+      { "name": "compact-toolbar", "value": "560px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Button",
+      "kind": "button",
+      "refersTo": "button",
+      "description": "Quiet fill action button; primary variant takes the selection blue.",
+      "html": "<button class=\"ds-btn\">Rescan</button> <button class=\"ds-btn ds-btn-primary\">Scan</button>",
+      "css": ".ds-btn{font:500 12px/1 Geist,system-ui,sans-serif;display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 12px;border:none;border-radius:7px;background:var(--bg-sunken-light,#ececef);color:var(--ink-light,#1d1d1f);cursor:pointer;transition:background 120ms cubic-bezier(0.22,0.9,0.3,1)}.ds-btn:hover{background:var(--fill-hover,rgba(0,0,0,0.05))}.ds-btn:active{background:var(--fill-active,rgba(0,0,0,0.08))}.ds-btn:focus-visible{outline:2.5px solid rgba(10,102,224,0.55);outline-offset:0.5px}.ds-btn-primary{background:var(--accent-light,#0a66e0);color:#fff}.ds-btn-primary:hover{background:color-mix(in srgb,var(--accent-light,#0a66e0) 88%,black)}"
+    },
+    {
+      "name": "Icon Button",
+      "kind": "button",
+      "refersTo": "icon-button",
+      "description": "Transparent 28px square toolbar affordance; active state tints blue.",
+      "html": "<button class=\"ds-icon-btn\" aria-label=\"Back\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M15 18l-6-6 6-6\"/></svg></button>",
+      "css": ".ds-icon-btn{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border:none;border-radius:7px;background:transparent;color:var(--ink-2,rgba(29,29,31,0.62));cursor:pointer;transition:background 120ms cubic-bezier(0.22,0.9,0.3,1),color 120ms cubic-bezier(0.22,0.9,0.3,1)}.ds-icon-btn:hover{background:var(--fill-hover,rgba(0,0,0,0.05));color:var(--ink-light,#1d1d1f)}.ds-icon-btn:focus-visible{outline:2.5px solid rgba(10,102,224,0.55)}.ds-icon-btn.is-on{background:rgba(10,102,224,0.12);color:var(--accent-light,#0a66e0)}"
+    },
+    {
+      "name": "Segmented Control",
+      "kind": "chip",
+      "refersTo": "input-search",
+      "description": "Sunken bed with a lifted pressed segment — the system's only raised affordance.",
+      "html": "<div class=\"ds-seg\" role=\"tablist\"><button class=\"ds-seg-item\" aria-pressed=\"true\">Size</button><button class=\"ds-seg-item\" aria-pressed=\"false\">Name</button><button class=\"ds-seg-item\" aria-pressed=\"false\">Type</button></div>",
+      "css": ".ds-seg{display:inline-flex;gap:1px;padding:2px;border-radius:8px;background:var(--bg-sunken-light,#ececef)}.ds-seg-item{font:500 12px/1 Geist,system-ui,sans-serif;height:22px;padding:0 9px;border:none;border-radius:6px;background:transparent;color:var(--ink-2,rgba(29,29,31,0.62));cursor:pointer;transition:background 120ms cubic-bezier(0.22,0.9,0.3,1),color 120ms cubic-bezier(0.22,0.9,0.3,1)}.ds-seg-item:hover{color:var(--ink-light,#1d1d1f)}.ds-seg-item[aria-pressed=true]{background:var(--bg-elevated-light,#fff);color:var(--ink-light,#1d1d1f);box-shadow:0 0 0 0.5px rgba(0,0,0,0.09),0 1px 2px rgba(0,0,0,0.07)}.ds-seg-item:focus-visible{outline:2.5px solid rgba(10,102,224,0.55)}"
+    },
+    {
+      "name": "Search Field",
+      "kind": "input",
+      "refersTo": "input-search",
+      "description": "Filter field; focus grows it and paints the blue ring.",
+      "html": "<label class=\"ds-search\"><svg width=\"13\" height=\"13\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"><circle cx=\"11\" cy=\"11\" r=\"7\"/><path d=\"M21 21l-4.3-4.3\"/></svg><input placeholder=\"Filter files and folders\"/></label>",
+      "css": ".ds-search{display:inline-flex;align-items:center;gap:6px;height:28px;width:200px;padding:0 9px;border-radius:8px;background:var(--bg-sunken-light,#ececef);color:var(--ink-2,rgba(29,29,31,0.62));transition:background 120ms cubic-bezier(0.22,0.9,0.3,1),width 200ms cubic-bezier(0.22,0.9,0.3,1)}.ds-search:focus-within{background:var(--bg-elevated-light,#fff);box-shadow:0 0 0 0.5px rgba(0,0,0,0.16),0 0 0 2.5px rgba(10,102,224,0.55);width:240px}.ds-search input{flex:1;min-width:0;border:none;outline:none;background:transparent;font:400 12.5px/1 Geist,system-ui,sans-serif;color:var(--ink-light,#1d1d1f)}"
+    },
+    {
+      "name": "Keycap Chip",
+      "kind": "chip",
+      "refersTo": "button",
+      "description": "Mono keycap in a hairline box; used in menus and the palette hint.",
+      "html": "<span class=\"ds-kbd\">⌘K</span>",
+      "css": ".ds-kbd{font:500 10.5px/1.4 'Geist Mono',ui-monospace,monospace;color:var(--ink-3,rgba(29,29,31,0.38));background:var(--fill-quiet,rgba(0,0,0,0.035));border:0.5px solid rgba(0,0,0,0.09);border-radius:5px;padding:1.5px 5px;min-width:18px;text-align:center;display:inline-block}"
+    },
+    {
+      "name": "Rail Section Row",
+      "kind": "card",
+      "refersTo": "button",
+      "description": "Hairline-stacked rail row: legend swatch row or largest-files row, all figures tabular.",
+      "html": "<div class=\"ds-rail-row\"><span class=\"ds-dot\" style=\"background:#3d7fdd\"></span><span class=\"ds-row-label\">Media</span><span class=\"ds-fig\">815 MB</span><span class=\"ds-fig ds-share\">15%</span></div>",
+      "css": ".ds-rail-row{display:flex;align-items:center;gap:8px;padding:5px 0;font:400 13px/1.4 Geist,system-ui,sans-serif;color:var(--ink-light,#1d1d1f)}.ds-dot{width:9px;height:9px;border-radius:50%;flex:none}.ds-row-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ds-fig{font:500 12px/1 'Geist Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums;color:var(--ink-2,rgba(29,29,31,0.62))}.ds-share{width:44px;text-align:right}"
+    },
+    {
+      "name": "Statusbar",
+      "kind": "nav",
+      "refersTo": "button",
+      "description": "28px footer: tabular readouts left, quiet text buttons right.",
+      "html": "<footer class=\"ds-statusbar\"><span class=\"ds-fig\">5 items</span><span class=\"ds-fig\">413 files</span><span class=\"ds-fig\">8.31 GB</span><span class=\"ds-fig\">100.0% of volume</span><span class=\"ds-spacer\"></span><button class=\"ds-status-btn\">Rescan</button></footer>",
+      "css": ".ds-statusbar{display:flex;align-items:center;gap:14px;height:28px;padding:0 14px;border-top:1px solid rgba(0,0,0,0.09);font:400 11.5px/1 Geist,system-ui,sans-serif;color:var(--ink-2,rgba(29,29,31,0.62))}.ds-statusbar .ds-fig{font:500 11.5px/1 'Geist Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}.ds-spacer{flex:1}.ds-status-btn{font:inherit;border:none;background:transparent;color:var(--ink-2,rgba(29,29,31,0.62));padding:3px 6px;border-radius:6px;cursor:pointer;transition:background 100ms cubic-bezier(0.22,0.9,0.3,1)}.ds-status-btn:hover{background:var(--fill-hover,rgba(0,0,0,0.05));color:var(--ink-light,#1d1d1f)}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Instrument Panel",
+    "overview": "`space` borrows the craft discipline of Apple's system apps — Finder's restraint, Disk Utility's flat honesty, Photos' data-first framing — never their chrome, icons, or copy. The chrome is system furniture: neutral, slightly cool, hairline-divided, and deliberately quiet, so the treemap is the only region on screen with saturation and weight. The interface refuses the two defaults of the disk-tool category: the boxed card grid and the decorative dashboard with one big number and an accent.\n\nDensity is high and rhythm is tight (8pt base); every figure is tabular so numbers never jitter during live scans; every transition rides one motion curve. Light and dark are a matched pair, resolved from the same token names, never two themes.",
+    "keyCharacteristics": [
+      "The treemap owns all color; chrome is greyscale plus one selection blue.",
+      "Hairline 1px separators do all dividing — no cards, no shadows on resting surfaces.",
+      "Geist + Geist Mono only, self-hosted, weight steps 400/500/600.",
+      "Tabular figures everywhere a number can change.",
+      "One spring curve (420ms) for navigation, one short curve (120ms) for state."
+    ],
+    "rules": [
+      { "name": "The Chrome Greyscale Rule", "body": "No saturated hue outside the treemap, its legend, and the selection blue. If chrome needs emphasis, it gets ink weight, not color.", "section": "colors" },
+      { "name": "The Two-Channel Rule", "body": "Every category carries a text label and Caches carries a hatch; color is never the only encoding.", "section": "colors" },
+      { "name": "The Tabular Rule", "body": "Any string that can change while on screen — sizes, counts, percentages, paths — is Geist Mono with tabular-nums. Proportional figures in a live readout are a defect.", "section": "typography" },
+      { "name": "The Flat Resting Rule", "body": "Shadows respond to state or float; a shadow on a resting, in-flow surface is a defect.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do separate regions with 1px hairlines and fill tone.",
+      "Do set every live figure in Geist Mono with tabular-nums.",
+      "Do keep the treemap as the only saturated field; let it fill its container edge to edge at the container's exact aspect.",
+      "Do carry every transition on cubic-bezier(0.32, 0.72, 0, 1) (navigation, 420ms) or cubic-bezier(0.22, 0.9, 0.3, 1) (state, 120ms).",
+      "Do respect prefers-reduced-motion."
+    ],
+    "donts": [
+      "Don't add a second type family, or set a number that can change in proportional figures.",
+      "Don't put a shadow on a resting surface, or wrap a section in a card.",
+      "Don't use gradients, glassmorphism, ambient glows, blinking dots, or any element whose only job is to look designed.",
+      "Don't return the orange \"s\" letter-tile badge in any form; the wordmark is lowercase `space`, set in type.",
+      "Don't encode a category by hue alone.",
+      "Don't add a delete affordance anywhere — the product is read-only by construction."
+    ]
+  }
+}

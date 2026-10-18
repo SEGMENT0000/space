@@ -1,0 +1,94 @@
+/* ---------------------------------------------------------------
+   Tokens — the whole palette, both themes, one source of truth.
+   World: floating instrument panels on near-black ground; chrome
+   is neutral; the treemap data palette and one warm signal accent
+   own every saturated pixel on screen.
+   --------------------------------------------------------------- */
+
+@font-face {
+  font-family: "Geist";
+  src: url("../fonts/Geist-Variable.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Mono";
+  src: url("../fonts/GeistMono-Variable.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --font-sans: "Geist", system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, monospace;
+
+  /* light — whiter, not greyer; the panel carries the page */
+  --bg: #f1f1f3;
+  --bg-elevated: #ffffff;
+  --bg-sunken: #ebebed;
+  --fill-quiet: rgba(0, 0, 0, 0.035);
+  --fill-hover: rgba(0, 0, 0, 0.055);
+  --fill-active: rgba(0, 0, 0, 0.085);
+  --hairline: rgba(0, 0, 0, 0.08);
+  --hairline-strong: rgba(0, 0, 0, 0.16);
+  --ink: #1c1c1f;
+  --ink-2: rgba(28, 28, 31, 0.66);
+  --ink-3: rgba(28, 28, 31, 0.42);
+  --accent: #c9462e;
+  --accent-soft: rgba(201, 70, 46, 0.12);
+  --accent-ink: #ffffff;
+  --danger: #c7372f;
+  --danger-soft: rgba(199, 55, 47, 0.1);
+  --warn: #a06a15;
+  --focus: rgba(201, 70, 46, 0.5);
+  --scrim: rgba(241, 241, 243, 0.6);
+  --shadow-menu: 0 12px 36px rgba(0, 0, 0, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.09);
+
+  /* the panel language — floating surfaces on the ground */
+  --shadow-panel: 0 0 0 0.5px var(--hairline), 0 1px 3px rgba(0, 0, 0, 0.05);
+  --panel-edge: inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  --r-panel: 14px;
+  --r-menu: 12px;
+  --r-ctl: 8px;
+  --r-row: 7px;
+  --r-chip: 6px;
+  --r-plate: 8px;
+
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --bg: #0b0b0d;
+  --bg-elevated: #17171b;
+  --bg-sunken: #0d0d0f;
+  --fill-quiet: rgba(255, 255, 255, 0.045);
+  --fill-hover: rgba(255, 255, 255, 0.075);
+  --fill-active: rgba(255, 255, 255, 0.11);
+  --hairline: rgba(255, 255, 255, 0.075);
+  --hairline-strong: rgba(255, 255, 255, 0.15);
+  --ink: #f4f4f6;
+  --ink-2: rgba(244, 244, 246, 0.62);
+  --ink-3: rgba(244, 244, 246, 0.4);
+  --accent: #e8654a;
+  --accent-soft: rgba(232, 101, 74, 0.16);
+  --accent-ink: #201009;
+  --danger: #e5544b;
+  --danger-soft: rgba(229, 84, 75, 0.14);
+  --warn: #d9a23f;
+  --focus: rgba(232, 101, 74, 0.55);
+  --scrim: rgba(6, 6, 8, 0.55);
+  --shadow-menu: 0 16px 44px rgba(0, 0, 0, 0.55), 0 0 0 0.5px rgba(255, 255, 255, 0.09);
+
+  --shadow-panel: 0 0 0 0.5px var(--hairline), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --panel-edge: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+
+  color-scheme: dark;
+}
+
+/* the two curves — nothing in this app moves on any other */
+:root {
+  --ease-out: cubic-bezier(0.22, 0.9, 0.3, 1);
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+}

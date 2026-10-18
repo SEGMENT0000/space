@@ -1,0 +1,182 @@
+/* ---------------------------------------------------------------
+   Shell — app-level overlays owned by App.tsx: the boot state and
+   the command palette. Primitives come from primitives.css.
+   WHY: these are the only two surfaces that cover the whole window
+   before/independently of any screen, so they live with the shell
+   rather than inside a screen module. Boot is type on the ground —
+   nothing decorative; the palette is a floating layer, one of the
+   only surfaces allowed a shadow (it sits over a scrim).
+   --------------------------------------------------------------- */
+
+/* boot: the quiet center wordmark set in Geist 600, plus one honest
+   status line while the volumes are read. No spinner — a blank frame
+   would read as a hang, and a theatre of motion would claim progress
+   we can't yet report. No mark, no tile, no texture: type on the
+   ground and nothing else. */
+.boot {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+.boot-mark {
+  font-family: var(--font-sans);
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  color: var(--ink);
+}
+
+/* --------------------------------------------------- command palette */
+
+.pal-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: var(--scrim);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 14vh;
+}
+
+/* Surface comes from .float in primitives.css (elevated fill,
+   --r-menu 12px radius, --shadow-menu). .pal carries only its own
+   geometry and entrance so the floating vocabulary has one home. */
+.pal {
+  width: 560px;
+  max-width: calc(100vw - 48px);
+  overflow: hidden;
+  animation: pal-in 160ms var(--ease-out) both;
+}
+@keyframes pal-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.994);
+  }
+}
+
+.pal-input-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--ink-3);
+}
+.pal-input-row input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 14px;
+  /* typed text at full ink — the row's ink-3 tone is for the glyph and
+     placeholder only; input { color: inherit } would otherwise dim it */
+  color: var(--ink);
+}
+
+.pal-list {
+  max-height: 340px;
+  overflow-y: auto;
+  padding: 6px;
+  overscroll-behavior: contain;
+}
+/* group titles are labels, not headings — the .micro voice (500), not 600 */
+.pal-group {
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.005em;
+  color: var(--ink-2);
+  padding: 8px 9px 3px;
+}
+.pal-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  padding: 7px 9px;
+  border-radius: var(--r-row);
+  cursor: default;
+  text-align: left;
+  transition: background 120ms var(--ease-out);
+}
+.pal-item:hover {
+  background: var(--fill-hover);
+}
+.pal-item .ico {
+  color: var(--ink-2);
+  display: flex;
+  flex: none;
+}
+.pal-item .grow {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pal-item .sub {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  flex: none;
+}
+.pal-item .meta {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--ink-3);
+  flex: none;
+}
+/* active = the row Enter will run: one fill step up the greyscale ladder
+   (quiet — no accent tint across the row) plus the 2px accent bar inset
+   at the row's left edge, the selection mark. The glyph steps to full
+   ink and the secondary tones to ink-2 so the row stays legible on the
+   deeper fill. */
+.pal-item.is-active {
+  background: var(--fill-active);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.pal-item.is-active .ico {
+  color: var(--ink);
+}
+.pal-item.is-active .sub,
+.pal-item.is-active .meta {
+  color: var(--ink-2);
+}
+
+/* empty state: .micro lettering on the exact left edge a row label sits on
+   (6px list pad + 9px row pad). Color overrides the micro tone to ink-2 —
+   a micro-label may sit at ink-3, but an empty state is body text and has
+   to clear 4.5:1 in both themes. */
+.pal-empty {
+  margin: 0;
+  padding: 14px 9px;
+  color: var(--ink-2);
+}
+
+/* footer: keycap chips — each hint is a .kbd chip (mono 10.5px in its
+   0.5px hairline box) followed by a plain word. The words are a full
+   line of readable hint text, not a micro-label: ink-2 clears 4.5:1
+   (ink-3 lands near 2.3:1 on the elevated surface). */
+.pal-foot {
+  border-top: 1px solid var(--hairline);
+  padding: 8px 12px;
+  font-size: 11px;
+  color: var(--ink-2);
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.pal-foot .kbd {
+  color: var(--ink-2);
+}

@@ -1,0 +1,335 @@
+/* ---------------------------------------------------------------
+   Scan — the in-flight screen (ScanView.tsx). One floating
+   instrument panel, centered on the ground: a head band (volume
+   identity + quiet cancel), a hero figure over an indeterminate
+   meter on a dot-matrix bed, a hairline-divided counters row, a
+   rate-history strip of stepped ink bars on a second dot bed, and
+   the walking path at the foot. Hairlines are the only interior
+   structure — no cards, no nested surfaces. The only saturated
+   pixels are the meter's accent sweep (the scan's live action)
+   and the danger band that replaces it on failure. ProgressPayload
+   carries no total, so the meter never claims a width-percentage;
+   the bars plot raw observed deltas, quantized to flat steps.
+   --------------------------------------------------------------- */
+
+/* the screen: the panel centers on both axes via margin:auto, which degrades
+   to top-anchored the moment the panel outgrows the window (scrollable, and
+   the head never clips above the fold) */
+.scan {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  padding: 36px 24px 48px;
+}
+
+/* layout only — fill, radius, edge and shadow come from the .panel primitive */
+.scan-panel {
+  margin: auto;
+  width: 100%;
+  max-width: 620px;
+}
+
+/* bands meet at 1px hairlines: the panel's entire interior structure */
+.scan-panel > * + * {
+  border-top: 1px solid var(--hairline);
+}
+
+/* --------------------------------------------------- head band */
+
+.scan-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 20px 14px;
+  min-width: 0;
+}
+.scan-id {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.scan-name {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  margin: 0;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* mount + elapsed: mono 10.5 in ink-3 — ambient readouts, not labels;
+   tabular digits keep the ticking seconds from nudging the line */
+.scan-mount {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------- failure band
+   A full-bleed band in the danger channel — fill tone, not a box. */
+
+.scan-fail {
+  background: var(--danger-soft);
+  padding: 12px 20px 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  min-width: 0;
+}
+.scan-fail-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+/* the engine's message verbatim, selectable — the technical user copies it */
+.scan-fail-msg {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  margin: 0;
+  word-break: break-word;
+  user-select: text;
+}
+
+/* --------------------------------------------------- hero band */
+
+.scan-hero {
+  padding: 16px 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+.scan-meter-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+/* the meter: dot-matrix bed, indeterminate accent sweep. No fill width ever
+   encodes percent — the payload has no total; the sweep says "in flight". */
+.scan-meter {
+  flex: 1;
+  height: 10px;
+  position: relative;
+  overflow: hidden;
+  min-width: 0;
+}
+.scan-meter-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 18%;
+  background: var(--accent);
+  animation: scan-sweep 1.7s linear infinite;
+}
+/* the sweep fades at both ends so the loop never jump-cuts */
+@keyframes scan-sweep {
+  from {
+    transform: translateX(-105%);
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  85% {
+    opacity: 1;
+  }
+  to {
+    transform: translateX(660%);
+    opacity: 0;
+  }
+}
+/* the global reduced-motion clamp freezes loops into a strobe — park the
+   fill mid-bed instead: reads "indeterminate", never "18% done" */
+@media (prefers-reduced-motion: reduce) {
+  .scan-meter-fill {
+    animation: none;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+}
+/* the % slot: an honest dash — it exists so a total, if the engine ever
+   ships one, has a home at the meter's right end */
+.scan-pct {
+  flex: none;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+/* --------------------------------------------------- counters band */
+
+.scan-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  padding: 13px 20px 14px;
+  min-width: 0;
+}
+.scan-kpi {
+  min-width: 0;
+  overflow: hidden; /* a pathological count can never bleed a hairline */
+  padding: 0 14px;
+}
+.scan-kpi:first-child {
+  padding-left: 0;
+}
+.scan-kpi:last-child {
+  padding-right: 0;
+}
+.scan-kpi + .scan-kpi {
+  border-left: 1px solid var(--hairline);
+}
+/* the rate figure's unit rides smaller inside the 15px figure */
+.scan-kpi .stat-v .u {
+  font-size: 10.5px;
+}
+
+/* --------------------------------------------------- rate history band */
+
+.scan-rate {
+  padding: 14px 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.scan-rate-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.scan-peak {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  flex: none;
+  min-width: 0;
+}
+.scan-peak .num {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.scan-peak-u {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--ink-3);
+}
+
+/* the strip: the bed hugs exactly the sample slots it plots (90 × (4px bar +
+   2px gap) + padding), so a full window never ends in bare dots implying more
+   samples to come; a narrow window clips from the LEFT, always showing the
+   newest samples. Bars are square-cornered — data has no radius. */
+.scan-bars {
+  align-self: flex-start;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 2px;
+  height: 52px;
+  padding: 6px;
+  max-width: 100%;
+  overflow: hidden;
+}
+/* one bar per observed sample: height = value/window-max quantized to 1/14
+   steps (rendered as scaleY — a transform needs no definite ancestor height);
+   a zero-delta stall plots as the floor tick, because silence is data too */
+.scan-bar {
+  flex: none;
+  width: 4px;
+  align-self: stretch;
+  transform-origin: bottom;
+  background: color-mix(in srgb, var(--ink) 55%, transparent);
+}
+
+/* --------------------------------------------------- walking foot */
+
+.scan-foot {
+  padding: 11px 20px 13px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.scan-foot .micro {
+  flex: none;
+}
+/* head-clipped ellipsis: rtl keeps the tail (the entry under the walker)
+   visible when clipped; the title attribute carries the path in full */
+.scan-path {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+/* ------------------------------------------------------------ responsive */
+
+@media (max-width: 640px) {
+  .scan {
+    padding: 24px 16px 32px;
+  }
+  .scan-head {
+    padding: 14px 16px 12px;
+  }
+  .scan-hero {
+    padding: 14px 16px;
+  }
+  .scan-fail {
+    padding: 12px 16px;
+  }
+  .scan-kpis {
+    padding: 12px 16px 13px;
+  }
+  .scan-rate {
+    padding: 12px 16px 14px;
+  }
+  .scan-foot {
+    padding: 10px 16px 12px;
+  }
+}
+
+/* below ~460px the counters fold to two rows; these re-declarations come
+   after the base rules, so equal-specificity order keeps them in charge */
+@media (max-width: 460px) {
+  .scan-kpis {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .scan-kpi {
+    padding: 0;
+  }
+  .scan-kpi + .scan-kpi {
+    border-left: none;
+  }
+  .scan-kpi:nth-child(2n) {
+    border-left: 1px solid var(--hairline);
+    padding-left: 14px;
+  }
+  .scan-kpi:nth-child(n + 3) {
+    border-top: 1px solid var(--hairline);
+    padding-top: 11px;
+  }
+}
