@@ -87,8 +87,12 @@ function sanitizeStack(raw: string): string {
 export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
   state: ErrorBoundaryState = { err: null };
 
-  static getDerivedStateFromError(err: Error): ErrorBoundaryState {
-    return { err };
+  static getDerivedStateFromError(err: unknown): ErrorBoundaryState {
+    // Anything can be thrown (`throw "string"`, a rejected value rethrown
+    // through React) — normalize once at the boundary so render never
+    // reads `.message`/`.stack` off a non-Error and the fallback itself
+    // can't become the second failure.
+    return { err: err instanceof Error ? err : new Error(String(err)) };
   }
 
   componentDidCatch(err: Error): void {

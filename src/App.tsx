@@ -1,15 +1,17 @@
 // App shell: screen routing (volumes → scan → explorer), theme, file actions
-// (reveal / copy path / open), drag-and-drop scan targets, and the command
-// palette (Ctrl K). No logo tile — the wordmark is set in type, and appears
-// only in the boot state and on the volumes screen.
+// (reveal / copy path / open), drag-and-drop scan targets, the command
+// palette (Ctrl K), the global shortcut registry (ui.tsx chords dispatched
+// after App's built-ins), and the two-slot shell toast stack (sticky error +
+// transient status via useShell().status). No logo tile — the wordmark is
+// set in type, and appears only in the boot state and on the volumes screen.
 //
 // Boot is a *rendered* state, not a blank frame: a dead div reads as a hang,
 // so it carries the wordmark plus one honest status line (no spinner — we
 // don't know anything to spin about yet). In the palette every row wears a
 // glyph because a command list scans faster by shape than by sentence, and
 // jump rows print their real byte size so the list doubles as a ranked
-// readout. All of it is presentation: routing, scan wiring, and key
-// handling are untouched here.
+// readout. All of it is presentation: routing and scan wiring are untouched
+// here.
 
 import { isTauri } from "@tauri-apps/api/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -34,13 +36,22 @@ import {
   ZoomOut,
   type LucideIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DrivesView } from "./components/DrivesView";
 // errors.css rides in with this module (index.css is the lead's manifest —
 // untouched); notifyError/subscribeError are the single error funnel.
 import { ErrorBoundary, notifyError, subscribeError } from "./components/ErrorBoundary";
 import { ExplorerView, type ExplorerControl, type FileApi } from "./components/ExplorerView";
 import { ScanView } from "./components/ScanView";
+import {
+  ShellContext,
+  Toast,
+  dispatchShortcuts,
+  registerShortcut,
+  type ShellApi,
+  type StatusOptions,
+  type ThemeName,
+} from "./components/ui";
 import { formatBytes } from "./lib/format";
 import { cancelScan, enableDemo, onScanDone, onScanError, onScanProgress, startScan } from "./lib/ipc";
 import type { ProgressPayload } from "./lib/types";
@@ -52,6 +63,29 @@ interface ScanInfo {
   rootId: number;
   totalBytes: number;
   totalFiles: number;
+}
+
+/**
+ * Theme resolution — ONE source of truth, shared by App's state initializer
+ * and main.tsx's pre-paint hook (which sets <html data-theme> before React
+ * mounts so a dark-first window never flashes light). Precedence: the
+ * ?theme= deep link (review harness — explicit beats stored) > the persisted
+ * choice > dark (the world is dark-first). Never throws: storage can be
+ * disabled, and a boot path must not be where the app dies.
+ */
+export function resolveTheme(): ThemeName {
+  const q =
+    typeof location !== "undefined"
+      ? new URLSearchParams(location.search).get("theme")
+      : null;
+  if (q === "light" || q === "dark") return q;
+  try {
+    const saved = localStorage.getItem("space.theme");
+    if (saved === "light" || saved === "dark") return saved;
+  } catch {
+    /* storage unavailable — fall through to dark */
+  }
+  return "dark";
 }
 
 async function copyToClipboard(text: string): Promise<void> {
@@ -94,12 +128,14 @@ const zoomParam = (() => {
 // The default export is the OUTERMOST error net. WHY two boundaries: a
 // throw in AppShell's own body (state initializers, hook wiring) happens
 // above any boundary it renders itself — React would unmount the whole tree
-// and white-screen the window, and main.tsx is not ours to edit. This outer
-// one degrades such a throw to the quiet panel; the inner one (around .app)
-// catches screen-level throws while App's state, window listeners and toast
-// subscription stay alive. onError → notifyError keeps both nets on the one
-// funnel (App's subscriber renders the toast; if App itself is the casualty
-// there is no subscriber left — the panel below IS the message).
+// and white-screen the window, and main.tsx renders nothing but the root
+// (it pre-paints the theme, then calls createRoot — no fallback to catch).
+// This outer one degrades such a throw to the quiet panel; the inner one
+// (around .app) catches screen-level throws while App's state, window
+// listeners and toast subscription stay alive. onError → notifyError keeps
+// both nets on the one funnel (App's subscriber renders the toast; if App
+// itself is the casualty there is no subscriber left — the panel below IS
+// the message).
 export default function App() {
   return (
     <ErrorBoundary onError={(err) => notifyError(err.message)}>
@@ -111,21 +147,10 @@ export default function App() {
 function AppShell() {
   const [demo, setDemo] = useState(false);
   const [screen, setScreen] = useState<Screen>("boot");
-  const [theme, setTheme] = useState<"light" | "dark">(() => {
-    // ?theme= deep-link wins (screenshot/verification harness) — it never
-    // fights the user's stored preference because it's explicit, like ?screen=.
-    const q =
-      typeof location !== "undefined"
-        ? new URLSearchParams(location.search).get("theme")
-        : null;
-    if (q === "light" || q === "dark") return q;
-    const saved = localStorage.getItem("space.theme");
-    if (saved === "light" || saved === "dark") return saved;
-    // Dark-first world: with no stored preference and no deep link the
-    // app opens dark. Light stays one toggle away (statusbar / palette),
-    // and the choice persists like any other.
-    return "dark";
-  });
+  // resolved by resolveTheme() (deep link > stored > dark) — main.tsx has
+  // already painted the same value on <html data-theme>, so this state and
+  // the first paint can never disagree
+  const [theme, setTheme] = useState<ThemeName>(resolveTheme);
   const [scanRoot, setScanRoot] = useState("");
   const [scanInfo, setScanInfo] = useState<ScanInfo | null>(null);
   const [progress, setProgress] = useState<ProgressPayload | null>(null);
@@ -161,6 +186,52 @@ function AppShell() {
     setErrToast(msg);
   }, []);
 
+  // ------------------------------------------------------------ status slot
+  // The quiet non-error voice every screen speaks through
+  // useShell().status(msg) ("Path copied", "Rescan queued…"). WHY a second
+  // slot instead of reusing the error funnel: errors are sticky — manual
+  // dismiss only, an unacknowledged failure never vanishes on a timer —
+  // while status notes are transient, and a transient note must never be
+  // able to displace a sticky error. Both render in the .toast-stack below,
+  // error nearest the bottom (the slot the old error toast occupied).
+  // WHY App owns the timer, not Toast's dismissAfter: progress ticks at
+  // ~120ms during a scan re-render App, and a timer keyed on a fresh
+  // onDismiss closure would reset forever and never fire. An id-guarded
+  // timeout in this ref only clears the status it belongs to.
+  const [statusToast, setStatusToast] = useState<{
+    id: number;
+    msg: string;
+    key?: string;
+    tone?: StatusOptions["tone"];
+  } | null>(null);
+  const statusSeq = useRef(0);
+  const statusTimer = useRef(0);
+  const status = useCallback((message: string, opts?: StatusOptions) => {
+    const id = ++statusSeq.current;
+    setStatusToast({ id, msg: message, key: opts?.key, tone: opts?.tone });
+    window.clearTimeout(statusTimer.current);
+    statusTimer.current = window.setTimeout(() => {
+      setStatusToast((s) => (s && s.id === id ? null : s));
+    }, opts?.ms ?? 2600);
+  }, []);
+  useEffect(() => () => window.clearTimeout(statusTimer.current), []);
+
+  // ------------------------------------------------------------ shell context
+  // Theme + status() + the shortcut registry, handed to every screen via
+  // context so components can stop threading parallel prop chains. WHY a
+  // memo: the value object is a dependency of any consumer effect — an
+  // inline literal re-ran e.g. ExplorerView's control registration on every
+  // App render (same identity discipline as handleExplorerReady below).
+  // registerShortcut is the module singleton in ui.tsx — stable forever.
+  const toggleTheme = useCallback(
+    () => setTheme((t) => (t === "dark" ? "light" : "dark")),
+    [],
+  );
+  const shell = useMemo<ShellApi>(
+    () => ({ theme, setTheme, toggleTheme, status, registerShortcut }),
+    [theme, toggleTheme, status],
+  );
+
   // ------------------------------------------------------------ boot
 
   useEffect(() => {
@@ -194,6 +265,17 @@ function AppShell() {
         // synthetic progress ramp (hand-picked byte deltas, fixed fictional
         // paths, no randomness) so the redesigned screen can be reviewed and
         // screenshotted without a real multi-minute scan.
+        //
+        // WHY the ramp loops forever instead of ending: this harness never
+        // emits a scan://done or scan://error payload (there is no scan), so
+        // a ramp that stops leaves the meter quiet — ~2s later ScanView's
+        // honesty check prints the stall line and the sweep parks, and QA
+        // shots read as a dead scan. Auto-emitting a demo done would be
+        // worse: it would yank the harness off the very screen ?screen=scan
+        // exists to park on. Looping keeps counters, rate strip and walking
+        // path live for as long as the reviewer looks — the stall line can
+        // never appear, and Esc/Cancel still leaves through the normal
+        // cancel beat to the volumes screen.
         const q =
           typeof location !== "undefined"
             ? new URLSearchParams(location.search)
@@ -232,7 +314,10 @@ function AppShell() {
               current: walk[step % walk.length],
               elapsedMs: step * 140,
             });
-            if (step >= 40) window.clearInterval(tick);
+            // NO terminal step: the ramp is the harness's terminal state —
+            // it wraps (shape/walk are indexed modulo) and runs for the
+            // session so the instrument never goes quiet (see the comment
+            // above). The `dead` cleanup above is its only stop.
           }, 140);
           un.push(() => window.clearInterval(tick));
           return;
@@ -343,8 +428,30 @@ function AppShell() {
   }, [demo, scanInfo, scanRoot]);
 
   const cancel = useCallback(() => {
+    // Best-effort fire-and-forget (unchanged semantics): a rejected
+    // cancel keeps surfacing through the §D funnel — unhandledrejection →
+    // quiet toast — instead of being swallowed in a catch here.
     void cancelScan();
-    setScreen("drives");
+    // THE CANCEL BEAT. ScanView disables its button and prints
+    // "Cancelling…" in the SAME React batch as this call, so the old
+    // synchronous setScreen unmounted that state before the frame ever
+    // painted — the acknowledgment was invisible. Defer the swap by one
+    // short window so the disabling state is actually shown for several
+    // frames. WHY a timer, not a double rAF: rAF stops firing in a
+    // backgrounded webview and would strand the window on the scan
+    // screen; timers keep firing (throttled) and always land. WHY not
+    // await cancelScan(): the demo branch resolves in a microtask — the
+    // continuation could still coalesce into the same paint — and an
+    // invoke that never answered would strand the swap entirely. The
+    // functional guard makes the beat leave ONLY the scan screen: if
+    // scan://done wins the race, the finished map stands and the beat
+    // no-ops. Cancel path ONLY — onScanDone still swaps in its own
+    // handler with zero added delay: a finished scan reaches the map
+    // immediately (no fake delay on the success path).
+    window.setTimeout(
+      () => setScreen((s) => (s === "scan" ? "drives" : s)),
+      220,
+    );
   }, []);
 
   // ------------------------------------------------------------ explorer handle
@@ -370,21 +477,39 @@ function AppShell() {
   );
 
   // ------------------------------------------------------------ keys
-
+  // One window listener, two tiers: App's built-ins claim their chords
+  // first (the palette toggle must never be shadowable by a component
+  // registration), then the shared registry in ui.tsx gets first refusal
+  // on everything else. Escape closes the palette from anywhere — the
+  // input's own Esc handler only covers focus-inside-the-input, so a Tab
+  // into the palette list used to strand the overlay open.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Auto-repeat must not hammer a toggle: holding Ctrl K would flicker
+      // the palette open/closed while the key bottoms out. (Explorer's own
+      // listener is separate and keeps its repeat behavior — held
+      // Backspace-to-go-up still repeats.)
+      if (e.repeat) return;
       const mod = e.ctrlKey || e.metaKey;
       if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setPalOpen((v) => !v);
-      } else if (mod && e.key.toLowerCase() === "f" && screen === "explorer") {
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "f" && screen === "explorer") {
         e.preventDefault();
         ctlRef.current?.focusSearch();
+        return;
       }
+      if (e.key === "Escape" && palOpen) {
+        setPalOpen(false);
+        return;
+      }
+      dispatchShortcuts(e);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [screen]);
+  }, [screen, palOpen]);
 
   // ------------------------------------------------------------ runtime errors
   // The window-level half of §D's error net: React's boundary only sees
@@ -434,7 +559,7 @@ function AppShell() {
   // ------------------------------------------------------------ render
 
   return (
-    <>
+    <ShellContext.Provider value={shell}>
       {/* Inner net: a screen-level throw (drives / scan / explorer /
           palette) degrades to the quiet panel while App's state, window
           listeners and toast subscription survive — the shell never dies.
@@ -466,7 +591,7 @@ function AppShell() {
               volumeTotal={volumeTotal}
               theme={theme}
               api={fileApi}
-              onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+              onToggleTheme={toggleTheme}
               onRescan={demo ? () => setScreen("drives") : rescan}
               onShowDrives={() => setScreen("drives")}
               onOpenPalette={() => setPalOpen(true)}
@@ -480,33 +605,42 @@ function AppShell() {
               theme={theme}
               ctl={() => ctlRef.current}
               onClose={() => setPalOpen(false)}
-              onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+              onToggleTheme={toggleTheme}
               onRescan={demo ? () => setScreen("drives") : rescan}
               onDrives={() => setScreen("drives")}
             />
           )}
         </div>
       </ErrorBoundary>
-      {/* Sibling of the boundary, never its child: the toast must outlive a
+      {/* Sibling of the boundary, never its child: the stack must outlive a
           screen crash (the inner boundary swaps .app for its panel, but
           App's state stays mounted). Fixed bottom-right — clear of the
-          bottom-left gesture strip and of the 28px statusbar. Manual
-          dismiss only: an unacknowledged error does not vanish on a timer. */}
-      {errToast !== null && (
-        <div className="err-toast" role="status">
-          <span className="err-toast-key">runtime error</span>
-          <span className="err-toast-msg">{errToast}</span>
-          <button
-            type="button"
-            className="err-toast-x"
-            aria-label="Dismiss"
-            onClick={() => setErrToast(null)}
-          >
-            ×
-          </button>
-        </div>
-      )}
-    </>
+          bottom-left gesture strip and of the 30px statusbar; the error
+          slot keeps the exact corner the old toast held, status notes
+          stack above it. Manual dismiss for errors only: an
+          unacknowledged error does not vanish on a timer. */}
+      <div className="toast-stack">
+        {statusToast && (
+          <Toast
+            key={statusToast.id}
+            message={statusToast.msg}
+            tone={statusToast.tone ?? "neutral"}
+            labelKey={statusToast.key}
+            onDismiss={() =>
+              setStatusToast((s) => (s && s.id === statusToast.id ? null : s))
+            }
+          />
+        )}
+        {errToast !== null && (
+          <Toast
+            message={errToast}
+            tone="error"
+            labelKey="runtime error"
+            onDismiss={() => setErrToast(null)}
+          />
+        )}
+      </div>
+    </ShellContext.Provider>
   );
 }
 

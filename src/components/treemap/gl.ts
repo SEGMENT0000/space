@@ -7,12 +7,28 @@
 //   selection = one fill lift toward the warm accent (the --accent-soft
 //   strength, uAccentLift) + a 1px warm-accent inner ring — both read from
 //   the CSS --accent token, cached per theme by the renderer's palette;
-//   hover = one fill step lighter (uHoverLift) and nothing more — no ring.
+//   hover = one fill step lighter (uHoverLift, 0.12) and nothing more — no
+//   ring, no weight change.
 // The two lifts ride different channels (accent hue vs white) so a hovered
 // selected tile stays unambiguous. aSel is per instance, so the signal
 // scales to multi-select, and nothing bleeds outside the tile because both
 // the ring and the lifts are drawn strictly inside it. Caches keep their
-// fragment-level diagonal hatch on top of any state.
+// fragment-level diagonal hatch on top of any state — the hatch is derived
+// from the drawn fill (col * 0.88), so its line colour steps with the depth
+// tint at every level instead of staying pinned to the base category hue.
+//
+// STROKE LADDER (INS_BRIEF §3 / TILE SPEC — never escalates with depth):
+//   depth 0 → 1px  --hairline-strong
+//   depth 1 → 1px  --hairline
+//   depth 2 → 0.5px --hairline at 60% of its alpha
+//   depth 3+ → no stroke at all (fill delta + label only)
+// Both tokens are composited exactly as CSS would composite them over the
+// fill actually drawn (mix toward the token colour at the token alpha) and
+// are read from CSS per theme by the renderer's palette, so the ladder
+// reads identically in both themes and on every tint step. The vertex
+// shader's 0.5px inset keeps the field gutter (the panel ground) visible
+// between cells — the stroke sits just inside a tile's own edge, never on
+// top of a neighbour's.
 //
 // The per-instance alpha (aA) is live: blending is enabled at program
 // creation (straight SRC_ALPHA), which is what makes filtered/unavailable
@@ -96,7 +112,8 @@ void main() {
 export const TILE_FS = `#version 300 es
 precision mediump float;
 
-uniform vec3 uStroke;
+uniform vec4 uHair;        // --hairline (rgb, alpha) — depth-1 stroke step
+uniform vec4 uHairStrong;  // --hairline-strong (rgb, alpha) — depth-0 step
 uniform vec3 uAccent;
 uniform float uAccentLift;
 uniform float uHoverLift;
@@ -137,15 +154,17 @@ void main() {
   float dy = min(p.y - vTopLeft.y, vBottomRight.y - p.y);
   float dist = min(dx, dy);
   float px = 1.0 / uDpr;
-  // Resting tiles: the half-pixel hairline seam toward the FIELD color —
-  // uStroke carries the panel ground behind the canvas (read from CSS by
-  // the renderer's palette), so tiles read as cut cells of the panel and
-  // the seam behaves identically in both themes. Stepped down by depth
-  // (INS_BRIEF §3 stroke ladder): depth 0 keeps the full seam, depth-1
-  // child tiles render theirs at 0.6× alpha so a focused parent boundary
-  // always reads primary. Same geometry, same single mix.
-  if (dist < 1.5 * px * 0.5) {
-    col = mix(col, uStroke, vDepth < 0.5 ? 0.25 : 0.15);
+  // Stroke ladder (INS_BRIEF §3 / TILE SPEC): the parent level reads
+  // --hairline-strong, its children --hairline, deeper levels 0.5px at 60%,
+  // and the deepest tier none — a step DOWN per level, so stroke weight can
+  // never escalate to imply hierarchy. Bands are measured in CSS px from the
+  // inset rect, so a seam between two same-depth tiles reads exactly 1px
+  // (0.5px each side) and stays crisp at every DPR.
+  if (vDepth < 1.5) {
+    vec4 hair = vDepth < 0.5 ? uHairStrong : uHair;
+    if (dist < 1.0) col = mix(col, hair.rgb, hair.a);
+  } else if (vDepth < 2.5) {
+    if (dist < 0.5) col = mix(col, uHair.rgb, uHair.a * 0.6);
   }
   if (selected) {
     // 1px inner ring in the warm accent (the same token the chrome spends
@@ -165,7 +184,8 @@ export interface TileUniforms {
   uDpr: WebGLUniformLocation | null;
   uCssW: WebGLUniformLocation | null;
   uCssH: WebGLUniformLocation | null;
-  uStroke: WebGLUniformLocation | null;
+  uHair: WebGLUniformLocation | null;
+  uHairStrong: WebGLUniformLocation | null;
   uAccent: WebGLUniformLocation | null;
   uAccentLift: WebGLUniformLocation | null;
   uHoverLift: WebGLUniformLocation | null;
@@ -259,7 +279,8 @@ export function createTileProgram(gl: WebGL2RenderingContext): TileProgram {
     uDpr: gl.getUniformLocation(program, "uDpr"),
     uCssW: gl.getUniformLocation(program, "uCssW"),
     uCssH: gl.getUniformLocation(program, "uCssH"),
-    uStroke: gl.getUniformLocation(program, "uStroke"),
+    uHair: gl.getUniformLocation(program, "uHair"),
+    uHairStrong: gl.getUniformLocation(program, "uHairStrong"),
     uAccent: gl.getUniformLocation(program, "uAccent"),
     uAccentLift: gl.getUniformLocation(program, "uAccentLift"),
     uHoverLift: gl.getUniformLocation(program, "uHoverLift"),

@@ -10,7 +10,9 @@ import type {
   ChildrenResponse,
   DriveInfo,
   LargestFile,
+  PreviewEntryKind,
   PreviewFamily,
+  PreviewListKind,
   PreviewPayload,
   ScanStateDto,
 } from "./types";
@@ -138,6 +140,21 @@ const BY_PATH = new Map<string, DNode>();
     if (n.kids) index(n.kids, n);
   }
 })([ROOT], null);
+
+// A directory's bytes ARE its children's bytes — the scanner sums the walk,
+// so a parent can never be larger than the sum of what it contains. The
+// hand-authored demo sizes were approximate; the honest-remainder layout
+// correctly exposed the gaps as mystery “other” area. Normalize bottom-up
+// so the demo exercises the real invariant, the map's proportions are true,
+// and the rail's category total agrees with its headline.
+(function normalize(n: DNode): number {
+  if (n.kids && n.kids.length > 0) {
+    let sum = 0;
+    for (const k of n.kids) sum += normalize(k);
+    n.size = sum;
+  }
+  return n.size;
+})(ROOT);
 
 function toEntry(n: DNode, withSub: boolean): ChildEntry {
   return {
@@ -279,6 +296,10 @@ export function buildDemo(): DemoState {
 // Content is real-shaped — actual JSON/TS/ini/log syntax, real file-signature
 // bytes, plausible numbers — never lorem ipsum, never gray noise. The demo
 // must be indistinguishable in craft from the Rust payloads.
+// The one family the demo never emits is MEDIA: there are no real bytes to
+// play behind a fictional path, and the web build has no asset-protocol
+// scope (previewPlate's own MEDIA plate answers "needs the desktop app"
+// outside Tauri) — so playable files land on their honest META readout.
 
 type Rng = () => number;
 
@@ -378,6 +399,7 @@ const TEXT_EXTS = new Set(
   (
     "txt md rtf log logs csv json yaml yml toml xml " +
     "ini cfg conf env properties reg plist " +
+    "docx odt " +
     "rs ts tsx js jsx mjs cjs py java c cpp h hpp cc go sh ps1 bat sql vue " +
     "m3u m3u8 vtt srt ass ssa eml mbox " +
     "pem crt cer asc key pub eps svg " +
@@ -392,8 +414,14 @@ const HEX_EXTS = new Set(
   ).split(" "),
 );
 const DB_EXTS = new Set("db sqlite sqlite3".split(" "));
-// vhd/vhdx/wim are opaque containers without an ISO PVD → META, not LIST.
-const LIST_EXTS = new Set("zip rar 7z tar cab epub xlsx ods iso img dmg".split(" "));
+// Exactly the extensions the Rust dispatcher lists (preview.rs): zip/epub
+// via their central directory, tar, iso/img trees, xlsx/ods sheets. rar, 7z,
+// cab, dmg and vhd/vhdx/wim are NOT listed — the zip probe fails and §B
+// falls back to a META magic card, so the demo falls back with it.
+const LIST_EXTS = new Set("zip tar epub xlsx ods iso img".split(" "));
+// Zip members whose payload ships already compressed are stored, not
+// deflated — the archive-tool words the Rust central-dir reader prints.
+const ZIP_STORE_EXTS = new Set("jpg jpeg png gif webp mp4 mkv mov m4a mp3 flac ogg zip pdf".split(" "));
 
 function familyFor(ext: string): PreviewFamily {
   if (!ext) return "hex"; // §A: extensionless names sniff as binary
@@ -465,6 +493,10 @@ const SIGNATURES: Record<string, string> = {
   img: "CD001 @ 0x8000",
   vhdx: "76 68 64 78 66 69 6C 65",
   wim: "4D 53 57 49 4D",
+  "7z": "37 7A BC AF 27 1C",
+  rar: "52 61 72 21 1A 07",
+  vhd: "63 6F 6E 65 63 74 69 78",
+  vmdk: "4B 44 4D 56",
   dcm: "44 49 43 4D",
   fits: "SIMPLE  = T",
   h5: "89 48 44 46 0D 0A 1A 0A",
@@ -491,6 +523,17 @@ const IMAGE_DIMS: readonly (readonly [number, number])[] = [
   [96, 128],
 ];
 
+/** ORIGINAL source dimensions — types.ts: `w`/`h` are always the source's,
+ *  never the thumbnail's. Plausible phone/camera sizes, all under the 8 MP
+ *  decode cap. */
+const SOURCE_DIMS: readonly (readonly [number, number])[] = [
+  [1920, 1080],
+  [4032, 3024],
+  [3840, 2160],
+  [2048, 1365],
+  [3024, 4032],
+];
+
 // Flat two-tone pairs only — a gradient-free thumbnail still reads as a photo
 // at plate size, and gradients are banned outright.
 const TONE_PAIRS: readonly (readonly [string, string])[] = [
@@ -502,15 +545,17 @@ const TONE_PAIRS: readonly (readonly [string, string])[] = [
   ["#d8cfc0", "#8a7358"], // paper / kraft
 ];
 
-/** Folder tile → LIST (FLEET §G): its real demo children, size-sorted. */
+/** Folder tile → LIST (FLEET §G): its real demo children, size-sorted.
+ *  `kind: "folder"` names the enumerator (preview.rs folder walk); row kinds
+ *  are the real "dir" | "file" union. */
 function folderList(node: DNode): PreviewPayload {
-  const entries = (node.kids ?? [])
+  const entries: { name: string; size?: number; kind: PreviewEntryKind }[] = (node.kids ?? [])
     .slice()
     .sort((a, b) => b.size - a.size || a.name.localeCompare(b.name))
     .map((k) => ({ name: k.name, size: k.size, kind: k.isDir ? "dir" : "file" }));
   return {
     family: "list",
-    list: { entries, truncated: entries.length > 200, total: entries.length },
+    list: { entries, truncated: entries.length > 200, total: entries.length, kind: "folder" },
   };
 }
 
@@ -633,7 +678,7 @@ function stampMagic(buf: Uint8Array, ext: string, name: string): void {
   }
 }
 
-const TEXT_CAP = 200; // §A: TEXT head cap ~200 lines / 64 KB
+const TEXT_CAP = 120; // §A / types.ts: TEXT head cap 64 KB / 120 lines
 const TEXT_MIN = 16; // small enough files can still close structural syntax
 
 function textPayload(path: string, ext: string, seed: number, node: DNode | undefined): PreviewPayload {
@@ -645,7 +690,9 @@ function textPayload(path: string, ext: string, seed: number, node: DNode | unde
   const truncated = totalLines > TEXT_CAP;
   const count = Math.min(totalLines, TEXT_CAP);
   const lines = genText(ext, count, rand, stemOf(path));
-  return { family: "text", text: { lines, truncated, totalLines } };
+  // All synthesized text is ASCII in UTF-8 clothing — the same lossy utf-8
+  // readout the Rust head emits when no BOM says otherwise (model.rs TextPreview).
+  return { family: "text", text: { lines, truncated, totalLines, encoding: "utf-8" } };
 }
 
 function hexPayload(path: string, ext: string, seed: number, node: DNode | undefined): PreviewPayload {
@@ -672,34 +719,67 @@ function hexPayload(path: string, ext: string, seed: number, node: DNode | undef
   return { family: "hex", hex: { rows, base: 0, total: total || span } };
 }
 
-function imagePayload(_path: string, seed: number): PreviewPayload {
-  // No DOM (SSR/tests): hand back an honest META readout rather than a
-  // fabricated raster — the browser demo always has a canvas.
-  if (typeof document === "undefined") return metaPayload("png", seed, undefined);
+function imagePayload(
+  path: string,
+  ext: string,
+  seed: number,
+  node: DNode | undefined
+): PreviewPayload {
   const rand = rngFrom(seed);
-  const [w, h] = pick(rand, IMAGE_DIMS); // ≤256 longest edge (§A thumbnail cap)
+  // types.ts: `w`/`h` are the ORIGINAL source dimensions; the payload bitmap
+  // is the ≤512-edge re-encode, which the canvas below stands in for.
+  const [w, h] = pick(rand, SOURCE_DIMS);
+  const [tw, th] = pick(rand, IMAGE_DIMS); // canvas thumbnail, ≤256 longest edge
+  // No DOM (SSR/tests) or no 2D context: hand back an honest META readout —
+  // the REAL extension (never a hardcoded "png"), the source dimensions, and
+  // the true signature — rather than a fabricated raster. The browser demo
+  // always has a canvas.
+  const fallback = (): PreviewPayload => {
+    const fb = metaPayload(path, ext, seed, node);
+    fb.meta?.pairs.unshift({ k: "thumbnail", v: `${tw} × ${th} px (JPEG q80)` });
+    fb.meta?.pairs.unshift({ k: "dimensions", v: `${w} × ${h} px` });
+    return fb;
+  };
+  if (typeof document === "undefined") return fallback();
   const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
+  canvas.width = tw;
+  canvas.height = th;
   const ctx = canvas.getContext("2d");
-  if (!ctx) return metaPayload("png", seed, undefined);
+  if (!ctx) return fallback();
   const [a, b] = pick(rand, TONE_PAIRS);
   ctx.fillStyle = a;
-  ctx.fillRect(0, 0, w, h);
+  ctx.fillRect(0, 0, tw, th);
   // Horizon split at a seeded ratio — reads as sky/ground at thumbnail size.
   ctx.fillStyle = b;
-  ctx.fillRect(0, Math.round(h * (0.35 + rand() * 0.4)), w, h);
-  // Always image/jpeg, like the Rust re-encode (model.rs ImagePreview).
+  ctx.fillRect(0, Math.round(th * (0.35 + rand() * 0.4)), tw, th);
+  // Always image/jpeg, like the Rust re-encode (preview.rs build_image).
   return {
     family: "image",
     image: { dataUrl: canvas.toDataURL("image/jpeg", 0.8), w, h, mime: "image/jpeg" },
   };
 }
 
-function metaPayload(ext: string, seed: number, node: DNode | undefined): PreviewPayload {
+function metaPayload(path: string, ext: string, seed: number, node: DNode | undefined): PreviewPayload {
   const rand = rngFrom(seed);
   const size = node?.size ?? 0;
   const stem = node ? stemOf(node.name) : "";
+  // Locked/protected system files preview exactly like the live app's
+  // degraded card (preview.rs degraded_meta): the reason verbatim as the
+  // FIRST pair, then the mtime and the extension's type label, size when
+  // stat-able — and NO signature, because the bytes were never readable.
+  if (/^(pagefile|swapfile|hiberfil)\./i.test(node?.name ?? nameOf(path))) {
+    return {
+      family: "meta",
+      meta: {
+        pairs: [
+          { k: "note", v: "access denied" },
+          { k: "modified", v: mtimeOf(seed) },
+          { k: "type", v: `executable (.${ext || "sys"})` },
+          { k: "size", v: size > 0 ? formatBytes(size) : "unknown" },
+        ],
+      },
+    };
+  }
   const pairs: { k: string; v: string }[] = [];
   const dur = `${intOf(rand, 0, 24)}:${pad2(intOf(rand, 0, 59))}:${pad2(intOf(rand, 0, 59))}`;
   if (AUDIO_EXTS.has(ext)) {
@@ -747,6 +827,29 @@ function metaPayload(ext: string, seed: number, node: DNode | undefined): Previe
     pairs.push({ k: "format", v: `${methods[ext] ?? ext} compressed data` });
     pairs.push({ k: "stored size", v: formatBytes(size) });
     pairs.push({ k: "original size", v: formatBytes(Math.round(size * (2.2 + rand() * 3))) });
+  } else if (
+    ext === "7z" ||
+    ext === "rar" ||
+    ext === "cab" ||
+    ext === "dmg" ||
+    ext === "wim" ||
+    ext === "vhd" ||
+    ext === "vhdx" ||
+    ext === "vmdk"
+  ) {
+    // Rust never LISTs these — the zip probe fails and §B falls back to a
+    // magic card — so the demo's card carries the same honest class words.
+    const labels: Record<string, string> = {
+      "7z": "7z archive (LZMA2)",
+      rar: "RAR archive (RAR5)",
+      cab: "cabinet file (MSZIP)",
+      dmg: "disk image (UDZO)",
+      wim: "Windows imaging format (LZX)",
+      vhd: "Virtual PC disk (VHD)",
+      vhdx: "Hyper-V disk (VHDX)",
+      vmdk: "VMware disk (VMDK)",
+    };
+    pairs.push({ k: "format", v: labels[ext] ?? "disk image" });
   } else if (FONT_EXTS.has(ext)) {
     const formats: Record<string, string> = {
       ttf: "TrueType font",
@@ -832,15 +935,25 @@ function metaPayload(ext: string, seed: number, node: DNode | undefined): Previe
       SIGNATURES[ext] ??
       Array.from({ length: 4 }, () => Math.floor(rand() * 256).toString(16).toUpperCase().padStart(2, "0")).join(" "),
   });
-  return { family: "meta", meta: { pairs } };
+  const payload: PreviewPayload = { family: "meta", meta: { pairs } };
+  // Executables carry a hex head alongside the readout — model.rs: "except
+  // that executables carry `meta` + a `hex` head together (§A 'META + HEX
+  // head')". The bytes are the same stamped MZ/ELF head the HEX family gets,
+  // so a plate that annotates "DOS header" finds real data either way.
+  if (PE_EXTS.has(ext) || ELF_EXTS.has(ext)) {
+    const head = hexPayload(path, ext, seed, node);
+    if (head.hex) payload.hex = head.hex;
+  }
+  return payload;
 }
 
 function listPayload(path: string, ext: string, seed: number, node: DNode | undefined): PreviewPayload {
   const rand = rngFrom(seed);
   const stem = stemOf(path) || "archive";
   const total = node?.size ?? 0;
-  // Entry kind is exactly what Rust sends: "dir" | "file" (model.rs ListEntry).
-  const entries: { name: string; size?: number; kind: string }[] = [];
+  // Row kind is the real "dir" | "file" union (preview.rs ListEntry); the
+  // optional compression method rides zip/tar FILE rows only.
+  const entries: { name: string; size?: number; kind: PreviewEntryKind; method?: string }[] = [];
   if (ext === "xlsx" || ext === "ods") {
     const names = pick(rand, [
       ["Summary", "Q1 revenue", "Pipeline", "Raw export", "Notes"],
@@ -849,17 +962,20 @@ function listPayload(path: string, ext: string, seed: number, node: DNode | unde
     ]);
     for (const nm of names) entries.push({ name: nm, kind: "file" });
   } else if (ext === "epub") {
-    entries.push({ name: "mimetype", size: 20, kind: "file" });
-    entries.push({ name: "META-INF/container.xml", size: 364, kind: "file" });
+    // A zip like any other: the spec requires `mimetype` stored
+    // uncompressed, the XML members deflate.
+    entries.push({ name: "mimetype", size: 20, kind: "file", method: "Store" });
+    entries.push({ name: "META-INF/container.xml", size: 364, kind: "file", method: "Deflate" });
     const chapters = intOf(rand, 6, 14);
     for (let i = 1; i <= chapters; i++) {
       entries.push({
         name: `OEBPS/text/chapter-${String(i).padStart(2, "0")}.xhtml`,
         size: intOf(rand, 4096, 24000),
         kind: "file",
+        method: "Deflate",
       });
     }
-    entries.push({ name: "OEBPS/toc.ncx", size: intOf(rand, 2048, 8000), kind: "file" });
+    entries.push({ name: "OEBPS/toc.ncx", size: intOf(rand, 2048, 8000), kind: "file", method: "Deflate" });
   } else if (ext === "iso" || ext === "img") {
     entries.push({ name: "[BOOT]", kind: "dir" });
     entries.push({ name: "boot", kind: "dir" });
@@ -871,29 +987,24 @@ function listPayload(path: string, ext: string, seed: number, node: DNode | unde
     entries.push({ name: "casper/filesystem.squashfs", size: Math.round(total * 0.86) || 1.4 * GB, kind: "file" });
     entries.push({ name: "efi/boot/bootx64.efi", size: intOf(rand, 96, 256) * KB, kind: "file" });
     entries.push({ name: "md5sum.txt", size: intOf(rand, 20480, 90000), kind: "file" });
-  } else if (ext === "dmg") {
-    entries.push({ name: "Applications", kind: "dir" });
-    entries.push({ name: "Space.app", kind: "dir" });
-    entries.push({ name: "Space.app/Contents/Info.plist", size: intOf(rand, 1600, 2400), kind: "file" });
-    entries.push({ name: "Space.app/Contents/MacOS/Space", size: Math.round(total * 0.7) || 24 * MB, kind: "file" });
-    entries.push({ name: "README.txt", size: intOf(rand, 1024, 4096), kind: "file" });
   } else {
-    // zip/rar/7z/tar/cab — central directory only (§A), members size-sorted
-    // like Rust's head readout reports them.
+    // zip / tar — central directory or sequential walk only (§A). Tar
+    // members are always "Store"; zip members deflate unless the payload
+    // shipped already compressed (preview.rs zip_method).
     const n = intOf(rand, 40, 90);
     const sizes = scaledSizes(rand, n, total || 3 * MB);
-    if (ext === "cab") {
-      const cabNames = [`${stem}.mum`, `${stem}.xml`, `amd64_${stem}.manifest`, "wsuca.cat", "payload.bin"];
+    const isTar = ext === "tar";
+    const pushFile = (name: string, size: number): void => {
+      entries.push({
+        name,
+        size,
+        kind: "file",
+        method: isTar ? "Store" : ZIP_STORE_EXTS.has(extOf(name)) ? "Store" : "Deflate",
+      });
+    };
+    if (/photo|shoot|img|snap|wallpaper/i.test(stem)) {
       for (let i = 0; i < n; i++) {
-        entries.push({ name: cabNames[i % cabNames.length], size: sizes[i], kind: "file" });
-      }
-    } else if (/photo|shoot|img|snap|wallpaper/i.test(stem)) {
-      for (let i = 0; i < n; i++) {
-        entries.push({
-          name: `${stem}/IMG_${String(401 + i).padStart(4, "0")}.jpg`,
-          size: sizes[i],
-          kind: "file",
-        });
+        pushFile(`${stem}/IMG_${String(401 + i).padStart(4, "0")}.jpg`, sizes[i]);
       }
     } else {
       const dirs = ["src", "src/lib", "assets", "docs", "data", ""];
@@ -902,27 +1013,106 @@ function listPayload(path: string, ext: string, seed: number, node: DNode | unde
       for (let i = 0; i < n; i++) {
         const dir = pick(rand, dirs);
         const base = `${pick(rand, bases)}_${i}${pick(rand, exts)}`;
-        entries.push({ name: dir ? `${dir}/${base}` : base, size: sizes[i], kind: "file" });
+        pushFile(dir ? `${dir}/${base}` : base, sizes[i]);
       }
     }
     entries.sort((a, b) => (b.size ?? 0) - (a.size ?? 0));
   }
-  return { family: "list", list: { entries, truncated: false, total: entries.length } };
+  // Listing source (preview.rs enumerators): the word names what produced
+  // the rows — the plate keys its section label and columns off it.
+  const kind: PreviewListKind =
+    ext === "xlsx" || ext === "ods"
+      ? "sheet"
+      : ext === "tar"
+        ? "tar"
+        : ext === "iso" || ext === "img"
+          ? "iso"
+          : "zip";
+  return { family: "list", list: { entries, truncated: false, total: entries.length, kind } };
 }
 
 function dbPayload(seed: number): PreviewPayload {
   const rand = rngFrom(seed);
-  const names = pick(rand, [
-    ["nodes", "entries", "scan_runs", "categories", "settings"],
-    ["users", "sessions", "events", "files", "audit_log"],
-    ["tracks", "albums", "artists", "playlists", "library_meta"],
+  // Mirror preview.rs: tables in sqlite_master ORDER (alphabetical), `cols`
+  // from pragma names in declaration order, and sampled rows for the FIRST
+  // THREE tables only — never a row COUNT(*).
+  const schemas = pick(rand, [
+    [
+      { name: "categories", columns: ["id", "label", "hex", "bytes"] },
+      { name: "entries", columns: ["id", "path", "size", "cat", "scanned_at"] },
+      { name: "nodes", columns: ["id", "parent", "name", "size", "is_dir", "payload"] },
+      { name: "scan_runs", columns: ["id", "root", "files", "dirs", "errors", "elapsed_ms", "finished_at"] },
+      { name: "settings", columns: ["key", "value", "updated_at"] },
+    ],
+    [
+      { name: "albums", columns: ["id", "title", "artist_id", "added_at"] },
+      { name: "artists", columns: ["id", "name"] },
+      { name: "library_meta", columns: ["key", "value"] },
+      { name: "playlists", columns: ["id", "name", "track_count", "cover"] },
+      { name: "tracks", columns: ["id", "path", "title", "duration_ms", "bytes", "art"] },
+    ],
+    [
+      { name: "audit_log", columns: ["id", "actor", "action", "at", "detail"] },
+      { name: "events", columns: ["id", "kind", "at", "payload"] },
+      { name: "files", columns: ["id", "path", "bytes", "hash"] },
+      { name: "sessions", columns: ["id", "started_at", "ended_at", "remote"] },
+      { name: "users", columns: ["id", "name", "created_at", "last_seen"] },
+    ],
   ]);
-  // name + cols only — Rust never counts rows for a preview (model.rs DbTable).
-  const tables: { name: string; cols: number }[] = [{ name: "sqlite_master", cols: 6 }];
-  for (const nm of names) {
-    tables.push({ name: nm, cols: intOf(rand, 3, 14) });
-  }
+  const tables: { name: string; cols: number; columns?: string[]; rows?: string[][] }[] = [];
+  schemas.forEach((t, i) => {
+    const table: (typeof tables)[number] = { name: t.name, cols: t.columns.length, columns: [...t.columns] };
+    // DB_ROWS_TABLES = 3: leading tables get bounded sample rows, the rest
+    // ship the schema card alone.
+    if (i < 3) table.rows = dbSampleRows(rand, t.name, t.columns);
+    tables.push(table);
+  });
   return { family: "db", db: { tables, truncated: false } };
+}
+
+/** ≤5 sample rows as display text — the same cell rules as preview.rs
+ *  db_cell: integers raw, text scrubbed and short, NULLs the literal
+ *  "null", blobs a byte-size stub, never raw bytes. */
+function dbSampleRows(rand: Rng, table: string, columns: string[]): string[][] {
+  const paths = [
+    "D:\\clips\\raw-footage\\take_01.mp4",
+    "D:\\Windows\\System32\\ntoskrnl.exe",
+    "D:\\Users\\casey\\Downloads\\ubuntu-24.04.iso",
+    "D:\\Program Files\\Blender\\blender.exe",
+  ];
+  const names = ["casey", "scanner", "scheduler", "take_01", "blender", "ntoskrnl"];
+  const words = ["ok", "pending", "indexed", "skipped", "warn"];
+  const t0 = seedOf(table);
+  const rows: string[][] = [];
+  for (let r = 0, n = intOf(rand, 2, 5); r < n; r++) {
+    const cells: string[] = [];
+    for (const c of columns) {
+      // A sprinkling of real NULLs — the plate prints the word, never a blank.
+      if (/(^parent$|^ended_at$|_ended_at$|^remote$|^detail$|^cover$|^art$|^hash$)/.test(c) && (r + c.length) % 3 === 0) {
+        cells.push("null");
+      } else if (c === "id") {
+        cells.push(String(1001 + r));
+      } else if (/_at$/.test(c) || c === "at") {
+        cells.push(`${mtimeOf(t0 + r).replace(" ", "T")}:00Z`);
+      } else if (c === "path" || c === "root") {
+        cells.push(pick(rand, paths));
+      } else if (/(^size$|^bytes$|elapsed_ms|duration_ms|track_count|^files$|^dirs$|^errors$)/.test(c)) {
+        cells.push(String(intOf(rand, 1, 900000000)));
+      } else if (c === "cat") {
+        cells.push(String(intOf(rand, 0, 7)));
+      } else if (c === "is_dir") {
+        cells.push(rand() < 0.3 ? "1" : "0");
+      } else if (/(payload|cover|art|hash|blob|data)/.test(c)) {
+        cells.push(`<blob ${intOf(rand, 16, 65536)} B>`);
+      } else if (/(^name$|^title$|^label$|^actor$)/.test(c)) {
+        cells.push(pick(rand, names));
+      } else {
+        cells.push(pick(rand, words));
+      }
+    }
+    rows.push(cells);
+  }
+  return rows;
 }
 
 /** One payload per path — the DemoState.getPreview workhorse (§B demo fallback). */
@@ -936,19 +1126,24 @@ function synthPreview(path: string): PreviewPayload {
   }
   const ext = extOf(path);
   const seed = seedOf(path);
+  // Locked paging files preview as the live app's degraded card (§B
+  // degraded_meta): never a hex dump of bytes the OS would not let us read.
+  if (/^(pagefile|swapfile|hiberfil)\./i.test(nameOf(path))) {
+    return metaPayload(path, ext, seed, node);
+  }
   switch (familyFor(ext)) {
     case "text":
       return textPayload(path, ext, seed, node);
     case "hex":
       return hexPayload(path, ext, seed, node);
     case "image":
-      return imagePayload(path, seed);
+      return imagePayload(path, ext, seed, node);
     case "list":
       return listPayload(path, ext, seed, node);
     case "db":
       return dbPayload(seed);
     default:
-      return metaPayload(ext, seed, node);
+      return metaPayload(path, ext, seed, node);
   }
 }
 

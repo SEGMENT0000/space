@@ -53,28 +53,63 @@
 // an accent-soft fill lift (see gl.ts), which scales to multi-select; hover
 // is one fill step lighter and the hovered/selected label draws full-ink.
 // The label overlay resolves collisions largest-first, and depth-0 labels
-// carry a category swatch so hue is never the only channel.
+// carry a category swatch so hue is never the only channel. The BIG label
+// tier stays depth-0-only; deeper labels all share the quiet 10.5px tier.
+//
+// Directories subdivide LAZILY to MAX_INTERIOR_DEPTH: the view feeds
+// already-fetched interiors through `expanded`, and the draw loop asks for
+// the ones that can visibly subdivide (requestInteriors). An interior
+// folder's preview is its interior, so it never plates — unless the interior
+// has no plate-worthy content at all, in which case collapseContentlessInteriors
+// removes its descendants and turns it into a leaf folder first. Preview
+// plates belong to FILE tiles at any depth AND to LEAF FOLDERS (directories
+// with no child rect this frame): their real folder listing is strictly better
+// than a dead grey fill, and since they have no children, no plate can ever
+// stack on another.
 
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import { themeTokens } from "../../lib/colors";
-import { buildFrame, fitViewport, findWorldRect, enterFromForZoomOut, zoomOutEnterFrom } from "../../lib/treemap/layout";
+import { formatBytes } from "../../lib/format";
+import {
+  buildFrame,
+  collapseContentlessInteriors,
+  fitViewport,
+  findWorldRect,
+  enterFromForZoomOut,
+  zoomOutEnterFrom,
+  labelTierFor,
+  MAX_INTERIOR_DEPTH,
+  projectedAreaPx,
+} from "../../lib/treemap/layout";
 import type {
   TreemapCanvasProps,
   TreemapHandle,
+  TreemapFrameData,
+  TileRef,
   Viewport,
   WorldRect,
 } from "../../lib/treemap/types";
 import type { ChildEntry, PreviewPayload } from "../../lib/types";
 import { createTileProgram, INSTANCE_STRIDE, HOVER_LIFT, type TileProgram } from "./gl";
-import { createPlate, fillFallbackPlate, fillPlate } from "./previewPlate";
+import { createPlate, fillFallbackPlate, fillPlate, type PlateMeta } from "./previewPlate";
 
+/** Nav/zoom animation duration — the FALLBACK for tokens.css `--dur-nav`
+ *  (420ms), which loadMotion() reads at runtime (CSS owns the number; this
+ *  literal only covers an unparseable token). Clamped to ~0 outright under
+ *  prefers-reduced-motion (see reducedMotion + tick/animateTo). */
 const ZOOM_MS = 420;
+/** Wheel-lerp smoothing factor — 1 (an outright snap) under reduced motion. */
+const WHEEL_LERP = 0.18;
+/** Duration applied when prefers-reduced-motion is on: one millisecond of
+ *  easing is a cut for every practical purpose, while keeping the same code
+ *  path (no branch that could skip a viewport invariant check). */
+const REDUCED_MS = 0.01;
 // Zoom ceiling, relative to the fitted scale. The floor is NOT a constant:
 // it is fit().scale itself (see the fill invariant in the header) — zooming
 // out past the fitted view would expose background, so it is not allowed.
 // MAX_ZOOM is only the ORDINARY ceiling: zoomCeilingAt() raises it (never
 // lowers it) for the tile under the gesture point so deep zoom can always
-// reach that tile's preview gate — see BUG 2.
+// reach that tile's plate-readable box — see BUG 2.
 const MAX_ZOOM = 14;
 
 /** Fallback accent (rgb 0..1) mirroring tokens.css — used only when the CSS
@@ -91,6 +126,16 @@ const ACCENT_SOFT_FALLBACK: Record<"light" | "dark", number> = {
   dark: 0.16,
 };
 
+/** Fallback stroke-ladder tokens (tokens.css), mirrored only for the case
+ *  where getComputedStyle hands back an unparseable declaration (never for
+ *  stock tokens): `--hairline` composites over the depth-1/2 stroke band,
+ *  `--hairline-strong` over the depth-0 band. rgb + alpha, because the
+ *  ladder must composite EXACTLY like CSS over the drawn tile fill. */
+const HAIR_FALLBACK: Record<"light" | "dark", { hair: [number, number, number, number]; strong: [number, number, number, number] }> = {
+  dark: { hair: [1, 1, 1, 0.075], strong: [1, 1, 1, 0.15] },
+  light: { hair: [0, 0, 0, 0.08], strong: [0, 0, 0, 0.16] },
+};
+
 /** The ink-2 step: the quietest target for a label's size line (the same
  *  62% alpha tokens.css builds --ink-2 with). Where a tile's fill is bright
  *  the 4.5:1 floor clamps the step back up — see quietAlphaFor(). */
@@ -100,6 +145,32 @@ const QUIET_MIN = 0.62;
 const SWATCH = 3.5;
 const SWATCH_GAP = 4;
 const SWATCH_BLOCK = SWATCH + SWATCH_GAP;
+
+// ------------------------------------------------------------- label tiers
+// TILE SPEC: depth-0 BIG tile (w ≥ 90 AND h ≥ 36) = Geist 600/11.5 name +
+// 3.5px category swatch (dropped when the name stops fitting beside it) +
+// mono 500/10.5 size·share line (dropped when it doesn't fit). Every other
+// tile = 500/10.5 name only. SELECTED rides 650; HOVER changes only the ink
+// alpha (0.95 → 1) — never weight, never a ring beyond the GL fill step.
+// The BIG tier is reserved for depth 0: nested interiors can now recurse to
+// MAX_INTERIOR_DEPTH, and promoting deep tiles would turn the map into a
+// wall of type. The deepest legible tier in the system is 9.5px and there is
+// NO tier below 10.5px here: a tile that cannot host the tier at these fixed
+// metrics drops its label — type never shrinks to fit, and a label never
+// bleeds outside its tile.
+const FONT_BIG = "600 11.5px Geist, sans-serif";
+const FONT_BIG_SEL = "650 11.5px Geist, sans-serif";
+const FONT_SMALL = "500 10.5px Geist, sans-serif";
+const FONT_SMALL_SEL = "650 10.5px Geist, sans-serif";
+const FONT_META = "500 10.5px 'Geist Mono', monospace";
+const BIG_W = 90;
+const BIG_H = 36;
+/** Label box geometry: 6px inset (LABEL_PAD), one 13px name line, an
+ *  optional 12px size·share band. The min-height gate below is exactly
+ *  pad + line, so a drawn box always ends inside the tile. */
+const LABEL_PAD = 6;
+const LABEL_LINE_H = 13;
+const LABEL_META_H = 12;
 
 // --------------------------------------------------------- preview plates
 // INS_BRIEF §2.0: a pooled layer of DOM plates sits over the GL canvas as a
@@ -116,8 +187,11 @@ const POOL = 24;
  *  their plain floating label. Priority = the tile's visible screen area,
  *  largest first, with a hysteresis bias for incumbents (INCUMBENT_BIAS) so
  *  a plate is not displaced by a newcomer of nearly equal area from one
- *  frame to the next. */
-const VISIBLE_CAP = 8;
+ *  frame to the next. The cap rides the POOL exactly: with a pooled node
+ *  per candidate there is no reason to withhold content from a tile the
+ *  ranking already prefers — the old 8-plate cap is what left a screen of
+ *  flat colour boxes carrying three previews. */
+const VISIBLE_CAP = POOL;
 const INCUMBENT_BIAS = 1.25;
 
 /** Per-family minimum tile size for a plate (§2.0 table). HEX is gated at
@@ -135,18 +209,70 @@ const PLATE_MIN: Record<string, readonly [number, number]> = {
   media: [240, 120],
 };
 
-/** Request gate = the LARGEST family threshold. A tile can't be keyed by
- *  family until its payload exists, so it only asks the parent (which
- *  resolves the path) once it is big enough that SOME family's plate would
- *  show — FLEET §G's "~360×200" deep-zoom gesture, taken from the table max.
- *  Lazy by construction: a fit view of a huge folder never sprays preview
- *  requests, and the explorer's LRU/cap stays meaningful. */
-const REQ_W = 260;
-const REQ_H = 110;
+/** Preview REQUEST floor (FLEET §D/G) — DECOUPLED from plate qualification.
+ *  A depth-0 FILE tile asks for its payload as soon as it is on-screen and at
+ *  least REQ_MIN_PX on both sides, far below every plate gate: the request is
+ *  what resolves the path and reads the bytes, so it must fire while the tile
+ *  is still small — otherwise a tile that plates after one more zoom (or on
+ *  hover) has no payload ready and shows nothing. Requests are therefore
+ *  cap-independent: they fire at fit view as well as deep zoom, and NEVER for
+ *  a directory tile (a folder's preview is its nested interior; see pass 1)
+ *  nor for a dimmed/filtered tile. Depth ≥ 1 has a larger floor — see
+ *  REQ_DEEP_MIN_W/H — because recursive interiors multiply file tiles. Once
+ *  per (entryId, nav generation) as the first attempt, then retried on the
+ *  backoff below — see reqFirst/reqLast. */
+const REQ_MIN_PX = 8;
 
-/** A request still unanswered after this many drawn frames (~0.5s at 60fps)
- *  is treated as never-returned and gets the honest fallback plate. The
- *  grace exists so a fast payload can never flash "unavailable" first. */
+/** Deep-tile request floor (depth ≥ 1): the smallest plate gate
+ *  (image/meta = 120×92). Lazily expanded interiors mean ONE map can hold
+ *  thousands of file tiles; asking for every 8px leaf would flood the
+ *  backend while the plate pool is capped at POOL = 24. A deep tile too
+ *  small to ever plate has no reason to read its bytes. Depth-0 tiles keep
+ *  the tiny floor above so a tile growing into a plate after one more zoom
+ *  already has its payload warm. */
+const REQ_DEEP_MIN_W = 120;
+const REQ_DEEP_MIN_H = 92;
+
+/** Interior-expansion request gates. A directory asks the view for its
+ *  children only when its PROJECTED tile can visibly subdivide (at least
+ *  EXPAND_MIN_AREA_PX CSS px², on-screen and undimmed) and it is shallower
+ *  than MAX_INTERIOR_DEPTH. EXPAND_BATCH caps requests per drawn frame so a
+ *  first paint cannot fan out into hundreds of IPC round-trips; the dedupe
+ *  Set is the progress ledger across frames. A failed fetch is memoised by
+ *  the view as an EMPTY array, which `.has()` sees as answered — the loop
+ *  stops naturally. */
+const EXPAND_MIN_AREA_PX = 7000;
+const EXPAND_BATCH = 6;
+
+/** Unanswered-request backoff (pass 1) + in-flight window (pass 3). The
+ *  backend queues heavy previews behind a small permit semaphore, so >0.5s
+ *  is routine and one silent attempt is not evidence of failure:
+ *  - REQ_RETRY_TICKS: drawn frames between attempts (~1.5s at 60fps);
+ *  - REQ_MAX_ATTEMPTS: attempts per (entryId, generation) — after this the
+ *    tile is honestly unavailable until the next generation;
+ *  - REQ_AWAIT_TICKS: while an unanswered request is inside this window it
+ *    counts as IN FLIGHT — pass 3 re-arms the fallback clock every frame,
+ *    so "no preview" can never be painted over a payload a moment away. */
+const REQ_RETRY_TICKS = 90;
+const REQ_MAX_ATTEMPTS = 3;
+const REQ_AWAIT_TICKS = REQ_RETRY_TICKS * REQ_MAX_ATTEMPTS + 60; // 330 (~5.5s)
+
+/** Plate-READABLE box, in CSS px: the size at which a plate stops being a
+ *  cramped stub and starts being an instrument. Deep-zoom headroom
+ *  (zoomCeilingAt) opens exactly as far as it takes the tile under the
+ *  pointer to reach it — this is a ceiling target, NOT a request gate
+ *  (requests ride the depth-sensitive floors above: REQ_MIN_PX at depth 0,
+ *  REQ_DEEP_MIN_* deeper). */
+const PLATE_TARGET_W = 260;
+const PLATE_TARGET_H = 110;
+
+/** A tile still awaiting its payload after this many IN-ACTIVE-WAITING drawn
+ *  frames (~0.5s at 60fps) is treated as never-returned and gets the honest
+ *  fallback plate. The clock is RE-ARMED every frame while the request is
+ *  genuinely in flight (pass 3, reqFirst/reqLast + REQ_AWAIT_TICKS), so a
+ *  slow backend queues its permits without this painting "no preview" over
+ *  a payload that lands moments later. The grace exists so a fast payload
+ *  can never flash "unavailable" first. */
 const FALLBACK_GRACE = 30;
 
 /** Plated tiles are PAINTED at their canvas-∩-tile box, not their full
@@ -198,6 +324,10 @@ interface ThemePalette {
   accentLift: number;
   /** the actual ground visible behind the GL canvas, rgb 0..1 */
   field: [number, number, number];
+  /** --hairline (rgb 0..1, alpha): the depth-1 stroke-ladder step */
+  hair: [number, number, number, number];
+  /** --hairline-strong (rgb 0..1, alpha): the depth-0 stroke step */
+  hairStrong: [number, number, number, number];
   /** premade 2D-canvas color strings for the marquee (theme change only) */
   marqueeFill: string;
   marqueeStroke: string;
@@ -313,7 +443,43 @@ function overlaps(a: Rect, b: Rect): boolean {
  *  written and consumed synchronously setGLHover → bufferSubData). */
 const hoverPatch = new Float32Array(1);
 
-export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
+/** OPTIONAL props this renderer accepts on top of the shared cross-file
+ *  contract (existing props are never renamed or removed):
+ *
+ *  `pathFor` — an absolute-path resolver for preview requests. The treemap
+ *  is path-dumb (ChildEntry/TileRef carry no path), so when the view does
+ *  not wire a resolver the request rides "" and the view resolves the real
+ *  path itself (its findEntry) — an empty path must therefore be treated as
+ *  "unresolved", never fetched verbatim. */
+export interface TreemapCanvasExtras {
+  pathFor?: (entryId: number) => string | undefined;
+}
+
+/** The published request handler shape: TWO arguments, fixed (FLEET §D/G).
+ *  Read through this alias so the call compiles whether types.ts currently
+ *  declares the 1-arg or the 2-arg form (the fleet is landing the 2-arg
+ *  contract); the renderer itself is path-dumb and always passes the path it
+ *  resolved through `pathFor`, "" meaning "unresolved — resolve it yourself"
+ *  (the view's findEntry does). */
+type NeedPreviewFn = (entryId: number, path: string) => void;
+
+/** Plate metadata for a tile (final plate contract §2.4): everything the
+ *  renderer knows about a tile WITHOUT a payload, so a card can always be
+ *  built — name, type (the plate parses the extension from `name`),
+ *  category, hero size and the share-of-parent denominator. Built only at
+ *  FILL time (never per frame), and passed to every fill so a null payload
+ *  degrades to a real META card instead of an empty sheet. */
+function plateMetaOf(ref: TileRef, parentSize: number): PlateMeta {
+  return {
+    name: ref.name,
+    size: ref.size,
+    isDir: ref.isDir,
+    cat: ref.cat,
+    parentSize,
+  };
+}
+
+export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps & TreemapCanvasExtras>(
   function TreemapCanvas(props, ref) {
     const wrapRef = useRef<HTMLDivElement>(null);
     const glCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -349,6 +515,8 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       accent: ACCENT_FALLBACK.light,
       accentLift: ACCENT_SOFT_FALLBACK.light,
       field: themeTokens("light").canvasBg,
+      hair: HAIR_FALLBACK.light.hair,
+      hairStrong: HAIR_FALLBACK.light.strong,
       marqueeFill: "rgba(201,70,46,0.12)",
       marqueeStroke: "rgba(201,70,46,0.8)",
     });
@@ -356,7 +524,13 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
     // the frame is owned here: rebuilt whenever the measured aspect or the
     // entries change, always at draw-time-fresh geometry
     const frame = useRef<ReturnType<typeof buildFrame> | null>(null);
-    const builtFor = useRef<{ entries: ChildEntry[]; parentSize: number; theme: string; aspect: number } | null>(null);
+    const builtFor = useRef<{
+      entries: ChildEntry[];
+      parentSize: number;
+      theme: string;
+      aspect: number;
+      expanded: ReadonlyMap<number, ChildEntry[]> | undefined;
+    } | null>(null);
     const pendingNav = useRef<{ dir: "in" | "out"; rect?: WorldRect } | null>(null);
 
     const vp = useRef<Viewport>({ tx: 0, ty: 0, scale: 1 });
@@ -389,17 +563,42 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       rect: Rect | null;
     } | null>(null);
 
-    const mcache = useRef<Map<string, number>>(new Map());
+    /** measureText cache, keyed font → text (two levels, so a HIT allocates
+     *  nothing: no `${font}|${text}` key string is ever built per frame —
+     *  the renderer contract forbids per-frame allocation). */
+    const mcache = useRef<Map<string, Map<string, number>>>(new Map());
+    /** fitText result cache, keyed font → text → floor(available width).
+     *  The floor keeps a cached truncation VALID at every larger width it
+     *  could later be used at (measured ≤ bucket ≤ actual), so the cache can
+     *  never overshoot the tile; sizes are CSS px, so the bucket is exact. */
+    const fitCache = useRef<Map<string, Map<string, Map<number, string>>>>(new Map());
     /** quantized-rgb → "rgb(...)" string cache: fillStyle assignments must
      *  be strings, but building them per label per frame allocates — keyed
      *  by the packed 8-bit triplet instead. */
     const rgbStrCache = useRef<Map<number, string>>(new Map());
+    /** largest-first label order + one world-area score per tile (parallel
+     *  scratch, grown on rebuild only); the comparator reads these, so the
+     *  sort itself is allocation-free every frame. */
+    const orderBuf = useRef<Int32Array>(new Int32Array(0));
+    const scoreBuf = useRef<Float32Array>(new Float32Array(0));
+    /** depth-0 size·share strings keyed by entryId, invalidated by frame
+     *  identity — formatTileMeta() allocates, steady-state frames don't. */
+    const metaCache = useRef<Map<number, string>>(new Map());
+    const metaCacheFrame = useRef<unknown>(null);
 
     // --------------------------------------------------- preview plate state
     const slots = useRef<PlateSlot[]>([]);
     /** entryId → its plate slot, for continuity across frames (Map.get only
      *  in the hot path; maintained on claim/unclaim) */
     const slotOf = useRef<Map<number, PlateSlot>>(new Map());
+    /** entryIds of DIRECTORY tiles that actually render a child interior in
+     *  the current frame. Those folders keep the "interior is the preview"
+     *  law (no plate may cover their children). A directory absent from this
+     *  set has no interior to show — depth cap, cap-truncated tail, empty or
+     *  unreadable expansion — so it is a LEAF FOLDER and may earn a folder
+     *  content card instead of staying a dead grey box. Reused Set, filled
+     *  per preview pass; no per-frame allocation. */
+    const interiorParents = useRef<Set<number>>(new Set());
     /** per frame-index flag: 1 = a VISIBLE plate covers this tile, so its
      *  floating map label is suppressed (the plate's head IS the label) */
     const plated = useRef<Uint8Array>(new Uint8Array(0));
@@ -411,11 +610,31 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
     const candTile = useRef<Int32Array>(new Int32Array(0));
     const candScore = useRef<Float64Array>(new Float64Array(0));
     const candOrd = useRef<Int32Array>(new Int32Array(0));
-    /** entryIds already requested this nav generation — cleared on frame
-     *  rebuild (the hover/drag reset point in ensureFrame) */
-    const reqOnce = useRef<Set<number>>(new Set());
+    /** Preview request bookkeeping, per nav generation (cleared on frame
+     *  rebuild — the generation boundary). reqFirst: the tick of an entry's
+     *  FIRST attempt (also the "already asked" guard, so the once-per-
+     *  entryId-per-generation law holds); reqLast: the tick of the most
+     *  recent attempt, driving the retry backoff. A payload ARRIVING is the
+     *  only success signal the renderer sees — absence past REQ_AWAIT_TICKS
+     *  is what makes a tile honestly unavailable. */
+    const reqFirst = useRef<Map<number, number>>(new Map());
+    const reqLast = useRef<Map<number, number>>(new Map());
+    /** entryIds whose INTERIOR EXPANSION was requested for the current
+     *  `entries` identity (navigation). Deliberately NOT cleared by an
+     *  `expanded` arrival: the answer (children or the parent's memoised
+     *  empty array) is here, and re-asking would loop. Cleared by the
+     *  entries effect below. */
+    const expandAsked = useRef<Set<number>>(new Set());
     /** monotonic drawn-frame counter: the fallback grace clock */
     const ticks = useRef(0);
+    /** prefers-reduced-motion, kept live by a MediaQueryList listener at
+     *  mount — never queried per frame. The CSS layer clamps its own
+     *  transitions globally; this clamps the JS viewport animations (drill/
+     *  zoom 420ms → 0.01ms, wheel lerp → snap) to the same law. */
+    const reducedMotion = useRef(false);
+    /** --dur-nav in ms, read once per theme load (loadMotion). CSS owns the
+     *  number; ZOOM_MS only covers an unparseable token. */
+    const durNav = useRef(ZOOM_MS);
     /** one-shot latch: a draw-loop exception is reported once, then the loop
      *  stops — no overlay spam, no silent loop death */
     const loopDead = useRef(false);
@@ -424,8 +643,6 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
     // (x, y, w, h) quads + a live count, replacing per-frame Rect churn
     const placedBuf = useRef<Float32Array>(new Float32Array(0));
     const placedN = useRef(0);
-    /** largest-first label order, preallocated on rebuild */
-    const orderBuf = useRef<Int32Array>(new Int32Array(0));
 
     const fit = () => {
       const f = frame.current;
@@ -503,13 +720,16 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
     /** Zoom ceiling for a gesture about canvas point (x, y) — BUG 2 (deep-zoom
      *  headroom). Normally MAX_ZOOM above the fit floor, but RAISED to
      *  whatever it takes for the tile under the point to both frame the view
-     *  and clear the preview request gate (REQ_W×REQ_H): 14×fit cannot get a
-     *  tile under ~2% of the view past the gate, so its plate was unreachable
-     *  by wheel/keyboard — while "Jump to" (zoomToTile) could already take any
-     *  tile to its fill scale. The ceiling follows the point, so it climbs as
-     *  the cursor moves from a directory to its sub-tiles, and it is never
-     *  below the live scale: a gesture can sit AT the ceiling but can never
-     *  be snapped down to it. */
+     *  and reach the PLATE-READABLE box (PLATE_TARGET_W×H): 14×fit cannot get
+     *  a tile under ~2% of the view to a comfortable plate, so it was
+     *  unreachable by wheel/keyboard — while "Jump to" (zoomToTile) could
+     *  already take any tile to its fill scale. The ceiling follows the
+     *  point, so it climbs as the cursor moves from a directory to its
+     *  sub-tiles, and it is never below the live scale: a gesture can sit AT
+     *  the ceiling but can never be snapped down to it. (Requests themselves
+     *  need only their request floor — REQ_MIN_PX at depth 0, the smallest
+     *  plate gate deeper — so this is about reaching a plate that READS, not
+     *  about reaching the request gate.) */
     const zoomCeilingAt = (x: number, y: number): number => {
       const base = fit().scale;
       let ceil = base * MAX_ZOOM;
@@ -521,10 +741,14 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
           if (t.w > 0 && t.h > 0) {
             // tile frames the canvas (same quantity zoomToTile aims at)
             const fillScale = Math.min(cssW.current / t.w, cssH.current / t.h);
-            // smallest scale at which the tile clears the plate gate
+            // smallest scale at which the tile's PLATE BOX reaches the
+            // plate-readable target (the box is the tile inset 4px per side,
+            // so the full tile must clear the target + the 8px inset; the
+            // canvas clamp caps it at the canvas dimension — a tile covering
+            // the canvas can't qualify for more than the canvas offers)
             const gateScale = Math.max(
-              Math.min(REQ_W, cssW.current) / t.w,
-              Math.min(REQ_H, cssH.current) / t.h,
+              Math.min(PLATE_TARGET_W + 8, cssW.current) / t.w,
+              Math.min(PLATE_TARGET_H + 8, cssH.current) / t.h,
             );
             if (fillScale > ceil) ceil = fillScale;
             if (gateScale > ceil) ceil = gateScale;
@@ -542,10 +766,10 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       if (!f) return -1;
       // Preview plates paint OVER the tile plane, so a pointer inside a
       // plate's painted box belongs to that plate's OWNER tile — never to
-      // whatever depth-1 tile happens to be hidden underneath it. Without
-      // this mask the listing's rows read as one item while the hover card
-      // names a different tile that the paper actually covers (identity
-      // must match what the pointer sees, not what the layout knows).
+      // another tile hidden underneath it. Without this mask the listing's
+      // rows read as one item while the hover card names a different tile
+      // that the paper actually covers (identity must match what the pointer
+      // sees, not what the layout knows).
       const pool = slots.current;
       for (let s = 0; s < pool.length; s++) {
         const slot = pool[s];
@@ -579,13 +803,33 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
         parseCssColor(cs.getPropertyValue("--accent-soft"))?.a ?? ACCENT_SOFT_FALLBACK[theme];
       const field =
         resolveOpaqueField(wrapRef.current) ?? themeTokens(theme).canvasBg;
+      // Stroke ladder (gl.ts): both hairline tokens, rgb + alpha, composited
+      // by the shader exactly as CSS would over each drawn fill.
+      const hairCss = parseCssColor(cs.getPropertyValue("--hairline"));
+      const strongCss = parseCssColor(cs.getPropertyValue("--hairline-strong"));
+      const fb = HAIR_FALLBACK[theme];
+      const hair: [number, number, number, number] = hairCss
+        ? [hairCss.rgb[0], hairCss.rgb[1], hairCss.rgb[2], hairCss.a]
+        : fb.hair;
+      const hairStrong: [number, number, number, number] = strongCss
+        ? [strongCss.rgb[0], strongCss.rgb[1], strongCss.rgb[2], strongCss.a]
+        : fb.strong;
       const r = (accent[0] * 255) | 0;
       const g = (accent[1] * 255) | 0;
       const b = (accent[2] * 255) | 0;
+      // Motion token (tokens.css --dur-nav): CSS owns the nav duration; the
+      // JS viewport animations read the same number so a token change moves
+      // both. A value that doesn't parse (missing token, rem, calc) keeps
+      // the ZOOM_MS fallback — never a NaN duration.
+      const durRaw = cs.getPropertyValue("--dur-nav").trim();
+      const durMs = durRaw.endsWith("ms") ? parseFloat(durRaw) : parseFloat(durRaw) * 1000;
+      if (Number.isFinite(durMs) && durMs > 0) durNav.current = durMs;
       palette.current = {
         accent,
         accentLift,
         field,
+        hair,
+        hairStrong,
         // marquee: accent-soft fill + a strong stroke, premade for the 2D canvas
         marqueeFill: theme === "dark" ? `rgba(${r},${g},${b},0.16)` : `rgba(${r},${g},${b},0.12)`,
         marqueeStroke: `rgba(${r},${g},${b},0.8)`,
@@ -713,7 +957,7 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
     // ------------------------------------------------------------ frame
 
     const ensureFrame = () => {
-      const { entries, parentSize, theme } = p.current;
+      const { entries, parentSize, theme, expanded } = p.current;
       if (cssW.current === 0 || cssH.current === 0 || entries.length === 0) {
         frame.current = null;
         builtFor.current = null;
@@ -745,6 +989,7 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
         prev.entries === entries &&
         prev.parentSize === parentSize &&
         prev.theme === theme &&
+        prev.expanded === expanded &&
         drift <= 0.5
       ) {
         // Frame survived the (sub-threshold) resize — but the VIEWPORT did
@@ -754,9 +999,37 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
         enforceLive();
         return;
       }
+      // "Same level" = every identity term except `expanded` still matches
+      // and the canvas did not resize: this rebuild is an interior ARRIVAL,
+      // not a navigation. Its geometry lands inside the SAME world (world
+      // dims derive from aspect only), so the live viewport stays valid and
+      // must be preserved — refitting on every lazy expansion would snap a
+      // zoomed-in user back to 100% several times a second.
+      const sameLevel =
+        prev !== null &&
+        prev.entries === entries &&
+        prev.parentSize === parentSize &&
+        prev.theme === theme &&
+        drift <= 0.5;
+      const contentChanged = !prev || prev.entries !== entries;
       const old = frame.current;
-      frame.current = buildFrame(entries, parentSize, aspect, theme);
-      builtFor.current = { entries, parentSize, theme, aspect };
+      const raw = buildFrame(entries, parentSize, aspect, theme, expanded);
+      // Contentless system folders (Windows, System32, ...) otherwise paint a
+      // field of hatching once their subfolders are too small to card. Collapse
+      // only the highest branch with no plate-worthy tile below it; a branch
+      // that owns a real card (Chrome, an app folder, a large file) stays a map.
+      frame.current = collapseContentlessInteriors(raw, {
+        scale: fitViewport(raw.world, cssW.current, cssH.current).scale,
+        viewportW: cssW.current,
+        viewportH: cssH.current,
+      });
+      builtFor.current = {
+        entries,
+        parentSize,
+        theme,
+        aspect,
+        expanded,
+      };
       // A rebuild re-baselines every raw frame index: hover and the armed
       // drag index still point into the OLD refs — leaving them live is
       // exactly how dimmed()/refs[i] threw (stale index, one frame late).
@@ -776,15 +1049,34 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       cancelPendingHover();
       // A rebuild re-baselines the preview request generation too: the parent
       // guards its fetches with a nav token, and the renderer re-asks for
-      // whatever qualifies on the new frame (once per entry per generation).
-      reqOnce.current.clear();
+      // whatever qualifies on the new frame (once per entry per generation,
+      // retried on the backoff — see REQ_RETRY_TICKS). Exception: an
+      // INTERIOR ARRIVAL stays inside the SAME navigation generation, so the
+      // attempt clocks must survive it — clearing them on every lazy
+      // expansion would re-ask every queued-out preview in the map. New
+      // child entryIds are absent from the maps anyway and ask normally.
+      if (!sameLevel) {
+        reqFirst.current.clear();
+        reqLast.current.clear();
+      }
+      // …and it re-baselines the plate → tile bindings that hitTest trusts.
+      // Until updatePreviews re-claims them (same tick on the draw path, one
+      // frame later on a resize measure), a pointer event must resolve
+      // against the NEW frame's tiles — never a plate slot still naming an
+      // index of the frame that was just replaced (the "hover resolves to
+      // the wrong owner" bug class). The plates stay PAINTED; only the
+      // identity bridge is dropped.
+      for (const s of slots.current) {
+        s.claimed = false;
+        s.tileIdx = -1;
+      }
       const nav = pendingNav.current;
       // Only a CONTENT SWAP consumes an armed nav transition: a resize/theme
       // rebuild landing between beginNav() and the new entries arriving must
       // leave it armed for the entries that are actually coming — otherwise
       // the drill-in would play against a rect of the wrong frame and the
       // real swap would land as a bare cut.
-      if (nav && (!prev || prev.entries !== entries)) {
+      if (nav && contentChanged) {
         pendingNav.current = null;
         vp.current =
           nav.dir === "in" && nav.rect && old
@@ -795,6 +1087,11 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
         // under the floor when the window resized under the old frame).
         vp.current = enforceFill(vp.current);
         animateTo(fit());
+      } else if (sameLevel) {
+        // Interior arrival inside the same level: keep the user's viewport
+        // (and any in-flight animation) — only re-check it against the
+        // fill invariant, whose world is unchanged.
+        enforceLive();
       } else {
         anim.current = null;
         wheelTarget.current = null;
@@ -876,9 +1173,9 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       gl.uniform1f(u.uDpr, dpr.current);
       gl.uniform1f(u.uCssW, cssW.current);
       gl.uniform1f(u.uCssH, cssH.current);
-      // Tile seams mix toward the field color: tiles read as cells cut from
-      // the panel ground (see gl.ts TILE_FS).
-      gl.uniform3f(u.uStroke, pal.field[0], pal.field[1], pal.field[2]);
+      // Stroke ladder tokens (gl.ts): composited by the shader per depth.
+      gl.uniform4f(u.uHair, pal.hair[0], pal.hair[1], pal.hair[2], pal.hair[3]);
+      gl.uniform4f(u.uHairStrong, pal.hairStrong[0], pal.hairStrong[1], pal.hairStrong[2], pal.hairStrong[3]);
       gl.uniform3f(u.uAccent, pal.accent[0], pal.accent[1], pal.accent[2]);
       gl.uniform1f(u.uAccentLift, pal.accentLift);
       gl.uniform1f(u.uHoverLift, HOVER_LIFT);
@@ -899,13 +1196,19 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
     };
 
     const measure = (ctx: CanvasRenderingContext2D, text: string, font: string): number => {
-      const key = `${font}|${text}`;
-      const hit = mcache.current.get(key);
+      // Two levels (font → text): a HIT builds no key string, so measuring
+      // a stable label set allocates nothing per frame.
+      let fm = mcache.current.get(font);
+      if (fm === undefined) {
+        fm = new Map();
+        mcache.current.set(font, fm);
+      }
+      const hit = fm.get(text);
       if (hit !== undefined) return hit;
       ctx.font = font;
       const w = ctx.measureText(text).width;
-      if (mcache.current.size > 4000) mcache.current.clear();
-      mcache.current.set(key, w);
+      if (fm.size > 4000) fm.clear();
+      fm.set(text, w);
       return w;
     };
 
@@ -916,15 +1219,221 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       maxW: number,
     ): string => {
       if (measure(ctx, text, font) <= maxW) return text;
+      // Truncate against floor(maxW): a cached result measured at the floor
+      // stays valid for every width ≥ it (measured ≤ bucket ≤ actual), so
+      // the steady-state frame hits the cache and allocates nothing — the
+      // bisect below (and its slice/ellipsis strings) runs once per
+      // (font, text, bucket) ever.
+      const bucket = Math.max(1, Math.floor(maxW));
+      let fm = fitCache.current.get(font);
+      if (fm === undefined) {
+        fm = new Map();
+        fitCache.current.set(font, fm);
+      }
+      let tm = fm.get(text);
+      if (tm === undefined) {
+        tm = new Map();
+        fm.set(text, tm);
+      }
+      const hit = tm.get(bucket);
+      if (hit !== undefined) return hit;
       let lo = 1;
       let hi = text.length;
       while (lo < hi) {
         const mid = (lo + hi + 1) >> 1;
         const cand = `${text.slice(0, mid)}…`;
-        if (measure(ctx, cand, font) <= maxW) lo = mid;
+        if (measure(ctx, cand, font) <= bucket) lo = mid;
         else hi = mid - 1;
       }
-      return lo <= 1 ? "" : `${text.slice(0, lo)}…`;
+      const out = lo <= 1 ? "" : `${text.slice(0, lo)}…`;
+      if (tm.size > 64) tm.clear();
+      tm.set(bucket, out);
+      return out;
+    };
+
+    /** depth-0 size·share line, memoized per frame: formatTileMeta() builds
+     *  fresh strings, and the draw path is not allowed to. The cache is
+     *  keyed by entryId and dropped whenever the frame identity changes
+     *  (the share denominator moves with it). */
+    const tileMeta = (
+      f: TreemapFrameData,
+      ref: TileRef,
+      total: number,
+    ): string => {
+      if (metaCacheFrame.current !== f) {
+        metaCacheFrame.current = f;
+        metaCache.current.clear();
+      }
+      const hit = metaCache.current.get(ref.entryId);
+      if (hit !== undefined) return hit;
+      const s = formatTileMeta(ref.size, total);
+      if (metaCache.current.size > 2000) metaCache.current.clear();
+      metaCache.current.set(ref.entryId, s);
+      return s;
+    };
+
+    /** Overlap against the preallocated placed-label store — absolute rule:
+     *  no label is ever drawn over another. Component scope (not the frame
+     *  closure): the per-frame draw path must not allocate. */
+    const placedOverlaps = (x: number, y: number, w: number, h: number): boolean => {
+      const buf = placedBuf.current;
+      for (let k = 0, n = placedN.current; k < n; k++) {
+        const o = k * 4;
+        if (
+          x < buf[o] + buf[o + 2] &&
+          buf[o] < x + w &&
+          y < buf[o + 1] + buf[o + 3] &&
+          buf[o + 1] < y + h
+        )
+          return true;
+      }
+      return false;
+    };
+
+    /** Record a placed label box. Grow-guarded: a rebuild resizes the
+     *  buffer, the frame loop only ever writes inside it. */
+    const pushPlaced = (x: number, y: number, w: number, h: number): void => {
+      const buf = placedBuf.current;
+      const o = placedN.current * 4;
+      if (o + 4 > buf.length) return;
+      buf[o] = x;
+      buf[o + 1] = y;
+      buf[o + 2] = w;
+      buf[o + 3] = h;
+      placedN.current++;
+    };
+
+    /** Area-descending comparator over the scratch score buffer — hoisted so
+     *  the per-frame sort allocates no closure. Ineligible tiles carry a
+     *  negative score and sort to the tail, where the passes skip them. */
+    const cmpLabelArea = (a: number, b: number): number =>
+      scoreBuf.current[b] - scoreBuf.current[a];
+
+    /** The same trick for the plate ranking: comparator over candScore (the
+     *  candidate tail is scored -1, so the whole scratch array sorts in
+     *  place and no subarray view is allocated per frame). */
+    const cmpPlateArea = (a: number, b: number): number =>
+      candScore.current[b] - candScore.current[a];
+
+    /** Focused = hovered or selected. The priority passes claim space for
+     *  these first, so a focus label can never stack over another label. */
+    const isFocused = (refs: TileRef[], i: number): boolean =>
+      hover.current === i || sel.current.has(refs[i].entryId);
+
+    /** One tile's floating label — TILE SPEC tiers (see FONT_* above):
+     *  depth-0 BIG (w ≥ 90 AND h ≥ 36) leads with the category swatch +
+     *  600/11.5 name + the mono size·share band; every other tile is a
+     *  500/10.5 name only. Layout aggregates ("17 more", negative id) also
+     *  take the BIG tier at any depth, with a plain byte count instead of a
+     *  share: a roll-up without its byte total is just a colored box.
+     *  SELECTED rides 650; HOVER moves only the ink alpha (0.95 → 1) — never
+     *  weight, never size. Type NEVER shrinks below its tier (10.5 is above
+     *  the 9.5 floor): a tile that cannot host the tier drops its label, and
+     *  a box that would bleed outside its tile is never drawn. Plated and
+     *  dimmed tiles never draw one. */
+    const drawOne = (
+      ctx: CanvasRenderingContext2D,
+      f: TreemapFrameData,
+      total: number,
+      i: number,
+    ): void => {
+      if (dimmed(i)) return;
+      // A tile with a VISIBLE plate never draws a floating label — the
+      // plate's header strip is its label (INS_BRIEF §2.0). Guards the
+      // hover pass too, which calls drawOne outside `order`.
+      const plv = plated.current;
+      if (i < plv.length && plv[i]) return;
+      const sc = vp.current.scale;
+      const tile = f.tiles[i];
+      const ref = f.refs[i];
+      // screenRectOf inlined (allocation-free draw loop)
+      const x0 = vp.current.tx + tile.x * sc;
+      const y0 = vp.current.ty + tile.y * sc;
+      const w = tile.w * sc;
+      const h = tile.h * sc;
+      if (x0 + w < 0 || y0 + h < 0 || x0 > cssW.current || y0 > cssH.current) return;
+      // shared LOD floor (layout.ts): 468px² = the label layer's minimum box
+      if (labelTierFor(projectedAreaPx(tile.w, tile.h, sc)) === "none") return;
+      const availW = w - LABEL_PAD * 2;
+      if (availW < 26 || h < LABEL_PAD + LABEL_LINE_H) return;
+
+      const isSel = sel.current.has(ref.entryId);
+      const isFocus = hover.current === i || isSel;
+      const aggregate = ref.entryId < 0;
+      const big = (ref.depth === 0 || aggregate) && w >= BIG_W && h >= BIG_H;
+      const nameFont = big
+        ? isSel
+          ? FONT_BIG_SEL
+          : FONT_BIG
+        : isSel
+          ? FONT_SMALL_SEL
+          : FONT_SMALL;
+
+      // Two-channel rule: depth-0 labels with room lead with a category
+      // swatch before the name. Reserve its width up front so the name
+      // fits beside it; if nothing survives the narrower measure, drop
+      // the swatch and fall back to a plain name at full width.
+      let useSwatch = false;
+      let name = "";
+      if (big) {
+        name = fitText(ctx, ref.name, nameFont, availW - SWATCH_BLOCK);
+        if (name && measure(ctx, name, nameFont) + SWATCH_BLOCK <= availW) useSwatch = true;
+      }
+      if (!useSwatch) name = fitText(ctx, ref.name, nameFont, availW);
+      if (!name) return;
+      const nameW = measure(ctx, name, nameFont) + (useSwatch ? SWATCH_BLOCK : 0);
+      let meta = "";
+      let metaW = 0;
+      if (big) {
+        // An aggregate's byte total is its whole story; a share-of-volume
+        // line would make it read like a single file. The count is already
+        // in the name ("17 more"), so the band is just the real bytes.
+        meta = aggregate ? formatBytes(ref.size) : tileMeta(f, ref, total);
+        metaW = measure(ctx, meta, FONT_META);
+        // The size·share band DROPS — never shrinks, never overlaps — when
+        // it lacks room in the measure or in the tile's remaining height.
+        if (metaW > availW || LABEL_PAD + LABEL_LINE_H + LABEL_META_H > h) {
+          meta = "";
+          metaW = 0;
+        }
+      }
+
+      const boxH = LABEL_LINE_H + (meta ? LABEL_META_H : 0);
+      const bx = x0 + LABEL_PAD;
+      const by = y0 + LABEL_PAD;
+      const bw = Math.max(nameW, metaW);
+      // final bleed guard: a box that cannot end inside its tile drops
+      if (by + boxH > y0 + h) return;
+      if (placedOverlaps(bx, by, bw, boxH)) return;
+      pushPlaced(bx, by, bw, boxH);
+
+      const ink = inkString(tile.text);
+      if (useSwatch) {
+        ctx.fillStyle = inkString(tile.fill);
+        const sy = by + (LABEL_LINE_H - SWATCH) / 2;
+        if (typeof ctx.roundRect === "function") {
+          ctx.beginPath();
+          ctx.roundRect(bx, sy, SWATCH, SWATCH, 1);
+          ctx.fill();
+        } else {
+          ctx.fillRect(bx, sy, SWATCH, SWATCH);
+        }
+      }
+      ctx.font = nameFont;
+      ctx.fillStyle = ink;
+      ctx.globalAlpha = isFocus ? 1 : 0.95;
+      ctx.textBaseline = "top";
+      ctx.fillText(name, bx + (useSwatch ? SWATCH_BLOCK : 0), by);
+      if (meta) {
+        ctx.font = FONT_META;
+        // Size line rides the quiet step: the tile's own (contrast-proven)
+        // ink composited at the quietest still-4.5:1 alpha — never fail
+        // the floor for the sake of quiet (see quietAlphaFor). Focus
+        // labels are full-ink (the hovered/selected readout).
+        ctx.globalAlpha = isFocus ? 1 : quietAlphaFor(tile.fill, tile.text);
+        ctx.fillText(meta, bx, by + LABEL_LINE_H + 1);
+      }
+      ctx.globalAlpha = 1;
     };
 
     const drawLabels = () => {
@@ -934,10 +1443,17 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       ctx.setTransform(dpr.current, 0, 0, dpr.current, 0, 0);
       ctx.clearRect(0, 0, cssW.current, cssH.current);
       const refs = f.refs;
-      if (placedBuf.current.length < refs.length * 4) {
-        // allocation on REBUILD only, never per frame
+      // The scratch buffers GROW only, so a shrink (fewer tiles after a
+      // rebuild) must re-fit them too: a larger buffer would carry stale
+      // scores past refs.length, and those sort into the read range. Still
+      // rebuild-only allocation — never per frame.
+      if (
+        placedBuf.current.length < refs.length * 4 ||
+        orderBuf.current.length !== refs.length
+      ) {
         placedBuf.current = new Float32Array(refs.length * 4);
         orderBuf.current = new Int32Array(refs.length);
+        scoreBuf.current = new Float32Array(refs.length);
       }
       placedN.current = 0;
       let total = 0;
@@ -945,149 +1461,35 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       total = total || 1;
 
       const order = orderBuf.current;
+      const score = scoreBuf.current;
       const pl = plated.current;
-      // Plated tiles are excluded from both priority passes: their label
-      // lives in the plate head (suppression is per frame index and refreshed
-      // by updatePreviews, which runs before this every frame).
-      let nOrd = 0;
-      for (let i = 0; i < refs.length; i++)
-        if (refs[i].depth === 0 && !(i < pl.length && pl[i])) order[nOrd++] = i;
-      for (let i = 0; i < refs.length; i++)
-        if (refs[i].depth === 1 && !(i < pl.length && pl[i])) order[nOrd++] = i;
-      const ord = order.subarray(0, nOrd);
-      ord.sort((a, b) => f.tiles[b].w * f.tiles[b].h - f.tiles[a].w * f.tiles[a].h);
-
-      /** Overlap against the preallocated placed-label store — absolute rule:
-       *  no label is ever drawn over another. */
-      const placedOverlaps = (x: number, y: number, w: number, h: number): boolean => {
-        const buf = placedBuf.current;
-        for (let k = 0, n = placedN.current; k < n; k++) {
-          const o = k * 4;
-          if (x < buf[o] + buf[o + 2] && buf[o] < x + w && y < buf[o + 1] + buf[o + 3] && buf[o + 1] < y + h)
-            return true;
-        }
-        return false;
-      };
-
-      const drawOne = (i: number) => {
-        if (dimmed(i)) return;
-        // A tile with a VISIBLE plate never draws a floating label — the
-        // plate's header strip is its label (INS_BRIEF §2.0). Guards the
-        // hover pass too, which calls drawOne outside `order`.
-        const plv = plated.current;
-        if (i < plv.length && plv[i]) return;
-        const sc = vp.current.scale;
-        const tile = f.tiles[i];
-        const ref = f.refs[i];
-        // screenRectOf inlined (allocation-free draw loop)
-        const x0 = vp.current.tx + tile.x * sc;
-        const y0 = vp.current.ty + tile.y * sc;
-        const w = tile.w * sc;
-        const h = tile.h * sc;
-        if (x0 + w < 0 || y0 + h < 0 || x0 > cssW.current || y0 > cssH.current) return;
-        const pad = 6;
-        const availW = w - pad * 2;
-        if (availW < 26 || h < 18) return;
-
-        const isSel = sel.current.has(ref.entryId);
-        const isFocus = hover.current === i || isSel;
-        const big = ref.depth === 0 && h >= 36 && w >= 90;
-        // Tile-label type (DESIGN.md): 600/11.5 big, 500/10.5 small — the
-        // SELECTED label rides 650 (variable Geist). Hover only lifts to
-        // full ink; weight is reserved for selection.
-        const nameFont = big
-          ? isSel
-            ? "650 11.5px Geist, sans-serif"
-            : "600 11.5px Geist, sans-serif"
-          : isSel
-            ? "650 10.5px Geist, sans-serif"
-            : "500 10.5px Geist, sans-serif";
-        const metaFont = "500 10.5px 'Geist Mono', monospace";
-
-        // Two-channel rule: depth-0 labels with room lead with a category
-        // swatch before the name. Reserve its width up front so the name
-        // fits beside it; if nothing survives the narrower measure, drop
-        // the swatch and fall back to a plain name at full width.
-        let useSwatch = false;
-        let name = "";
-        if (big) {
-          name = fitText(ctx, ref.name, nameFont, availW - SWATCH_BLOCK);
-          if (name && measure(ctx, name, nameFont) + SWATCH_BLOCK <= availW) useSwatch = true;
-        }
-        if (!useSwatch) name = fitText(ctx, ref.name, nameFont, availW);
-        if (!name) return;
-        const nameW = measure(ctx, name, nameFont) + (useSwatch ? SWATCH_BLOCK : 0);
-        let meta = "";
-        let metaW = 0;
-        if (big) {
-          meta = formatTileMeta(ref.size, total);
-          metaW = measure(ctx, meta, metaFont);
-          if (metaW > availW) meta = "";
-        }
-
-        const lineH = 13;
-        const boxH = lineH + (meta ? 12 : 0);
-        const bx = x0 + pad;
-        const by = y0 + pad;
-        const bw = Math.max(nameW, metaW);
-        if (placedOverlaps(bx, by, bw, boxH)) return;
-        {
-          const buf = placedBuf.current;
-          const o = placedN.current * 4;
-          buf[o] = bx;
-          buf[o + 1] = by;
-          buf[o + 2] = bw;
-          buf[o + 3] = boxH;
-          placedN.current++;
-        }
-
-        const ink = inkString(tile.text);
-        if (useSwatch) {
-          ctx.fillStyle = inkString(tile.fill);
-          const sy = by + (lineH - SWATCH) / 2;
-          if (typeof ctx.roundRect === "function") {
-            ctx.beginPath();
-            ctx.roundRect(bx, sy, SWATCH, SWATCH, 1);
-            ctx.fill();
-          } else {
-            ctx.fillRect(bx, sy, SWATCH, SWATCH);
-          }
-        }
-        ctx.font = nameFont;
-        ctx.fillStyle = ink;
-        ctx.globalAlpha = isFocus ? 1 : 0.95;
-        ctx.textBaseline = "top";
-        ctx.fillText(name, bx + (useSwatch ? SWATCH_BLOCK : 0), by);
-        if (meta) {
-          ctx.font = metaFont;
-          // Size line rides the quiet step: the tile's own (contrast-proven)
-          // ink composited at the quietest still-4.5:1 alpha — never fail
-          // the floor for the sake of quiet (see quietAlphaFor). Focus
-          // labels are full-ink (the hovered/selected readout).
-          ctx.globalAlpha = isFocus ? 1 : quietAlphaFor(tile.fill, tile.text);
-          ctx.fillText(meta, bx, by + lineH + 1);
-        }
-        ctx.globalAlpha = 1;
-      };
+      // Every tile takes a slot in the sort; ineligible ones (plated — their
+      // label lives in the plate head) carry a negative score and fall to
+      // the tail, where the passes skip them. Sorting the WHOLE scratch
+      // array in place avoids the subarray view a partial sort allocates.
+      for (let i = 0; i < refs.length; i++) {
+        order[i] = i;
+        score[i] = i < pl.length && pl[i] ? -1 : f.tiles[i].w * f.tiles[i].h;
+      }
+      order.sort(cmpLabelArea);
 
       // Priority passes: focused labels claim their space first — the
       // selection, then the hovered tile on top of them — so a focus label
       // can never stack over another label. Everything else yields: a label
       // that would collide with a focused one is the one dropped.
-      const isFocused = (i: number) =>
-        hover.current === i || sel.current.has(refs[i].entryId);
-      for (let k = 0; k < nOrd; k++) {
-        const i = ord[k];
-        if (isFocused(i) && hover.current !== i) drawOne(i);
+      for (let k = 0; k < refs.length; k++) {
+        const i = order[k];
+        if (score[i] < 0) continue;
+        if (isFocused(refs, i) && hover.current !== i) drawOne(ctx, f, total, i);
       }
       // Bounds check: hover is a raw frame index that can outlive a rebuild
       // by one frame (root cause of the dimmed()/refs[i] TypeError) — a stale
       // index must never reach drawOne.
-      if (hover.current >= 0 && hover.current < f.refs.length && isFocused(hover.current))
-        drawOne(hover.current);
-      for (let k = 0; k < nOrd; k++) {
-        const i = ord[k];
-        if (!isFocused(i)) drawOne(i);
+      if (hover.current >= 0 && hover.current < refs.length) drawOne(ctx, f, total, hover.current);
+      for (let k = 0; k < refs.length; k++) {
+        const i = order[k];
+        if (score[i] < 0) continue;
+        if (!isFocused(refs, i)) drawOne(ctx, f, total, i);
       }
 
       const d = drag.current;
@@ -1121,6 +1523,17 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       const f = frame.current;
       const refs = f?.refs;
       if (!f || !refs) return;
+      // Directory ids that ACTUALLY own a child tile this frame. A folder in
+      // this set is previewed by its interior and must never take a plate; a
+      // folder outside it has no interior to show (depth cap, truncated tail,
+      // empty/unreadable expansion) and is a leaf folder — the folder-card
+      // candidate pass 1 below may request and plate.
+      const withInterior = interiorParents.current;
+      withInterior.clear();
+      for (let i = 0; i < refs.length; i++) {
+        const parent = refs[i].parentEntryId;
+        if (parent != null) withInterior.add(parent);
+      }
       if (plated.current.length !== refs.length) {
         // allocation on REBUILD only, never per frame
         plated.current = new Uint8Array(refs.length);
@@ -1141,31 +1554,117 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
         s.tileIdx = -1;
       }
       const previews = p.current.previews;
-      const request = p.current.onNeedPreview;
+      // Published handler shape is (entryId, path) — read through the alias
+      // so either published arity of types.ts compiles (see NeedPreviewFn).
+      // The renderer is path-dumb: `pathFor` (optional) resolves a path when
+      // the view supplies one, "" otherwise — the view's findEntry does.
+      const request = p.current.onNeedPreview as NeedPreviewFn | undefined;
+      const pathFor = p.current.pathFor;
       const theme = p.current.theme;
       const vpt = vp.current;
       const sTile = candTile.current;
       const sScore = candScore.current;
       const sOrd = candOrd.current;
+      const now = ticks.current;
+      const first = reqFirst.current;
+      const last = reqLast.current;
 
-      // --- pass 1: qualify + request. Depth-0 only (a sub-tile's world rect
-      // lives INSIDE its parent's, so plating both stacks overlapping plates
-      // on the same origin). Requests fire slot- and cap-independently.
+      // Share-of-parent denominator for plate metadata — one O(depth-0)
+      // scalar pass, no allocation (plates are the only consumers).
+      let totalBytes = 0;
+      for (let i = 0; i < refs.length; i++) if (refs[i].depth === 0) totalBytes += refs[i].size;
+
+      // --- pass 1: REQUEST (decoupled from plating) → then qualify.
+      //
+      // REQUEST AND PLATE QUALIFICATION ARE DECOUPLED. A tile asks for its
+      // payload as soon as it is on-screen and clears its REQUEST FLOOR —
+      // long before any plate gate — because the request is what resolves
+      // the path and reads the bytes: a tile that is small now but plates
+      // after one more zoom (or on hover) must already have content warm,
+      // and "no preview" must only ever mean the backend had nothing to
+      // give. Requests are slot-, cap- and family-independent; they fire at
+      // fit view as well as deep zoom. The floor is depth-sensitive:
+      // depth 0 keeps the tiny REQ_MIN_PX warm-up gate; depth ≥ 1 requires
+      // the smallest PLATE gate (REQ_DEEP_MIN_W×H) because lazy recursion
+      // can multiply one map into thousands of file tiles while the plate
+      // pool stays capped at POOL = 24 — tiles too small to ever plate must
+      // not flood the backend with byte reads.
+      //
+      // A DIRECTORY with a rendered interior never asks: its interior IS the
+      // nested treemap, and expand/drill/zoom is its preview (locked law).
+      // A LEAF FOLDER — a directory with no child tiles this frame (depth
+      // cap, cap-truncated tail, empty or unreadable expansion) — has no
+      // interior to show, so it asks for its folder listing and may plate a
+      // real content card. That is the only way a large grey box can become
+      // content; it can never cover a child because there are none. FILE
+      // tiles ask at ANY depth. Plates still cannot stack: an interior folder
+      // is skipped, a leaf folder has no children, and a file has none.
       let nc = 0;
       for (let i = 0; i < refs.length; i++) {
         const ref = refs[i];
-        if (ref.depth !== 0) continue;
+        // Layout-only aggregates ("17 more") have no filesystem identity and
+        // must never reach pathFor/onNeedPreview. They are summaries, not
+        // previewable entries.
+        if (ref.entryId < 0) continue;
+        if (ref.isDir && withInterior.has(ref.entryId)) continue;
+        const leafFolder = ref.isDir;
         const t = f.tiles[i];
         const w = t.w * vpt.scale;
         const h = t.h * vpt.scale;
-        if (w < 8 || h < 8) continue;
+        // File floors are depth-sensitive (see above). A leaf-folder listing
+        // costs a read_dir + metadata head, and below the LIST plate gate the
+        // card could not render anyway — so the folder request floor IS the
+        // LIST gate, one request per qualifying folder per generation.
+        const floorW = leafFolder
+          ? PLATE_MIN.list[0]
+          : ref.depth === 0
+            ? REQ_MIN_PX
+            : REQ_DEEP_MIN_W;
+        const floorH = leafFolder
+          ? PLATE_MIN.list[1]
+          : ref.depth === 0
+            ? REQ_MIN_PX
+            : REQ_DEEP_MIN_H;
+        if (w < floorW || h < floorH) continue;
         const x = vpt.tx + t.x * vpt.scale;
         const y = vpt.ty + t.y * vpt.scale;
         if (x > cssW.current || y > cssH.current || x + w < 0 || y + h < 0) continue;
-        // A dimmed tile is a filtered tile: no content plate either.
+        // A dimmed tile is a filtered tile: no request, no content plate.
         if (dimmed(i)) continue;
 
-        // --- visible box: the plate is clamped to the canvas∩tile rect.
+        const payload: PreviewPayload | null | undefined = previews?.get(ref.entryId);
+
+        // --- REQUEST (above every plate gate, hoisted before them): fires
+        // for EVERY on-screen, non-dimmed FILE tile at any depth that clears
+        // its depth-sensitive request floor, and for a LEAF FOLDER at the
+        // LIST gate, independent of any plate/cap/family gate. The once-per-entryId-per-generation guard is reqFirst;
+        // a silent attempt retries on the backoff (REQ_RETRY_TICKS ×
+        // REQ_MAX_ATTEMPTS) so ONE queued-out attempt can never poison a tile
+        // as "no preview" for the rest of the generation. The payload
+        // arriving is the only success signal the renderer sees.
+        //
+        // `undefined` = NO ANSWER YET → ask. `null` = the pipeline already
+        // answered with an honest failure (preview.ts memoises failures per
+        // generation) → never re-ask: pass 3's fallback card is the correct
+        // response, and repeating the IPC would only re-deliver the same
+        // null. A present payload → nothing to ask.
+        if (payload === undefined && request) {
+          const f0 = first.get(ref.entryId);
+          if (f0 === undefined) {
+            first.set(ref.entryId, now);
+            last.set(ref.entryId, now);
+            request(ref.entryId, pathFor?.(ref.entryId) ?? "");
+          } else {
+            const l0 = last.get(ref.entryId) ?? f0;
+            if (now - l0 >= REQ_RETRY_TICKS && now - f0 < REQ_RETRY_TICKS * REQ_MAX_ATTEMPTS) {
+              last.set(ref.entryId, now);
+              request(ref.entryId, pathFor?.(ref.entryId) ?? "");
+            }
+          }
+        }
+
+        // --- PLATE QUALIFICATION (independent of the request above).
+        // Visible box: the plate is clamped to the canvas∩tile rect.
         // The 4px inset rides only the tile sides that are actually on
         // canvas; the clipped sides bleed to the canvas edge exactly like
         // the tile itself does (the canvas clips tiles at its own bounds).
@@ -1179,7 +1678,6 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
         const ph = Math.min(y + h - 4, cssH.current) - ptop;
         if (pw < PLATE_VISIBLE_MIN || ph < PLATE_VISIBLE_MIN) continue; // sliver → label only
 
-        const payload: PreviewPayload | undefined = previews?.get(ref.entryId);
         if (payload) {
           // Family from the payload discriminant — the renderer never sniffs
           // content. §Integrator-note-2/§A: svg previews as TEXT, NONE reads
@@ -1191,12 +1689,47 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
           const min = PLATE_MIN[famKey];
           if (!min || w < min[0] || h < min[1]) continue; // → floating label only
         } else {
-          // Nothing to show yet: ask once per entry per nav generation, and
-          // only above the request gate (see REQ_W/REQ_H above).
-          if (!request || w < REQ_W || h < REQ_H) continue;
-          if (!reqOnce.current.has(ref.entryId)) {
-            reqOnce.current.add(ref.entryId);
-            request(ref.entryId);
+          // PAYLOAD NOT IN HAND — two distinct answers, both eligible:
+          //  • `undefined` (absent): still in flight, asked above;
+          //  • `null`: the pipeline already ANSWERED with an honest failure
+          //    (preview.ts — "null means UNREADABLE … callers must render
+          //    their honest fallback card"), memoised for this generation.
+          // Either way the tile must still claim a slot, because pass 3 is
+          // the ONLY place a plate is ever shown — a tile skipped here can
+          // never paint its fallback META card, and the map degenerates to
+          // tint + label for every file whose payload is missing or failed
+          // (this was the regression: no plate anywhere despite every gate
+          // clearing). Two conditions, both pre-rewrite law:
+          //  1. a handler exists that could ever fill the slot;
+          //  2. the PAINTED box can host a card at all — the fallback ladder
+          //     paints its META card at exactly PLATE_MIN.meta (previewPlate
+          //     refuses below it), so that is the honest claim floor; below
+          //     it the floating label is all there is room for.
+          if (!request) continue;
+          if (pw < PLATE_MIN.meta[0] || ph < PLATE_MIN.meta[1]) continue;
+          // answered-failure (null) is NOT re-asked: preview.ts memoises
+          // failures per generation, so re-asking only repeats a known
+          // answer — pass 3's fallback card is the correct response.
+          if (payload === null) {
+            // (no request; candidacy continues below)
+          } else if (
+            // in-flight: first attempt once per entryId per generation,
+            // then a backoff retry (REQ_RETRY_TICKS × REQ_MAX_ATTEMPTS) so
+            // one queued-out attempt can never poison the tile for the
+            // whole generation. The payload arriving is the renderer's only
+            // success signal.
+            first.get(ref.entryId) !== undefined
+          ) {
+            const f0 = first.get(ref.entryId) as number;
+            const l0 = last.get(ref.entryId) ?? f0;
+            if (now - l0 >= REQ_RETRY_TICKS && now - f0 < REQ_RETRY_TICKS * REQ_MAX_ATTEMPTS) {
+              last.set(ref.entryId, now);
+              request(ref.entryId, pathFor?.(ref.entryId) ?? "");
+            }
+          } else {
+            first.set(ref.entryId, now);
+            last.set(ref.entryId, now);
+            request(ref.entryId, pathFor?.(ref.entryId) ?? "");
           }
         }
 
@@ -1207,11 +1740,15 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
         sOrd[nc] = nc;
         nc++;
       }
+      // Candidate tail scored -1 so the WHOLE scratch array sorts in place
+      // (a subarray view per frame is an allocation).
+      for (let k = nc; k < refs.length; k++) {
+        sScore[k] = -1;
+        sOrd[k] = k;
+      }
 
       // --- pass 2: rank largest-first and mark the visibility cap slots.
-      if (nc > 1) {
-        sOrd.subarray(0, nc).sort((a, b) => sScore[b] - sScore[a]);
-      }
+      sOrd.sort(cmpPlateArea);
       const shown = Math.min(nc, VISIBLE_CAP);
       for (let k = 0; k < shown; k++) vis[sTile[sOrd[k]]] = 1;
 
@@ -1233,21 +1770,20 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
         let pw = Math.min(x + w - 4, cssW.current) - pleft;
         let ph = Math.min(y + h - 4, cssH.current) - ptop;
 
-        const payload: PreviewPayload | undefined = previews?.get(ref.entryId);
+        const payload: PreviewPayload | null | undefined = previews?.get(ref.entryId);
         const fam = payload ? (payload.family as string) : "";
 
         // --tile-* units: the CSS calc subtracts the 8px inset back out, so
         // the painted plate is exactly pw×ph at (pleft, ptop).
         // ================================================== XL listing cap
         // A plate is a preview instrument, not a replacement for the map. A
-        // tile that covers most of the canvas (a profile folder at shallow
-        // zoom) lists 60+ rows and visually REPLACES the world: the map
-        // reads as a file list, zoom reads as dead, and every picking path
-        // hides under the paper. Long directory listings in such tiles are
-        // therefore capped to a bounded top-left panel — the tile's own
-        // treemap (its nested children) stays visible around it, so hover
-        // and drill land on what the eye can see. Modest tiles — the
-        // offline-vid class the design pinned — keep their full-tile
+        // FILE tile that covers most of the canvas (a giant archive at
+        // shallow zoom) lists 60+ rows and visually REPLACES the world: the
+        // map reads as a file list, zoom reads as dead, and every picking
+        // path hides under the paper. Long archive/table listings in such
+        // tiles are therefore capped to a bounded top-left panel — the
+        // tile's neighbourhood stays visible around it, so hover and drill
+        // land on what the eye can see. Modest tiles keep their full-tile
         // preview: only family LIST/DB payloads with 20+ offering rows and
         // a near-full-canvas tile are capped, nothing else ever is.
         const famU = fam.toUpperCase();
@@ -1336,7 +1872,17 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
             slot.theme !== theme ||
             (settled && drifted)
           ) {
-            fillPlate(slot.el, payload, { fileName: ref.name, theme, tile: { w: tw, h: th } });
+            // Tile metadata rides EVERY fill (final plate contract): a null
+            // payload then degrades to a real META card (name / type /
+            // category / share) instead of an empty sheet. entryId-stable,
+            // so the meta term never forces a refill on its own.
+            fillPlate(slot.el, payload, {
+              fileName: ref.name,
+              theme,
+              tile: { w: tw, h: th },
+              meta: plateMetaOf(ref, totalBytes),
+              parentSize: totalBytes,
+            });
             slot.entryId = ref.entryId;
             slot.fallback = false;
             slot.reason = "";
@@ -1360,14 +1906,28 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
             slot.fillW = 0;
             slot.reqTick = ticks.current;
           }
-          // Requested but nothing returned (yet): after the grace, the honest
-          // unavailable state with a factual reason — "no preview" means we
-          // asked and got nothing back (§3 leaf interior, §4.8 no guessing).
+          // The request may still be genuinely IN FLIGHT — the backend
+          // queues heavy previews behind a permit semaphore, so >0.5s is
+          // routine. While it is, re-arm the clock EVERY frame so the grace
+          // can never paint "no preview" over a payload a moment away.
+          // "In flight" = asked this generation and inside REQ_AWAIT_TICKS
+          // (past it the attempts are exhausted and the tile is honestly
+          // unavailable — see the retry gate in pass 1).
+          const f0 = reqFirst.current.get(ref.entryId);
+          if (f0 !== undefined && ticks.current - f0 < REQ_AWAIT_TICKS) slot.reqTick = ticks.current;
+          // Requested but nothing returned: after the await window and the
+          // grace, the honest unavailable state — "no preview" means we
+          // asked (up to REQ_MAX_ATTEMPTS) and got nothing back (§3 leaf
+          // interior, §4.8 no guessing). Tile metadata rides the fallback
+          // too, so a tile that still has facts paints the real META card
+          // rather than a bare sheet.
           if (ticks.current - slot.reqTick >= FALLBACK_GRACE) {
-            if (!slot.fallback || slot.reason !== "no preview") {
-              fillFallbackPlate(slot.el, "no preview");
+            if (!slot.fallback || slot.reason !== "no preview" || slot.theme !== theme) {
+              slot.el.dataset.theme = theme;
+              fillFallbackPlate(slot.el, "no preview", plateMetaOf(ref, totalBytes));
               slot.fallback = true;
               slot.reason = "no preview";
+              slot.theme = theme;
               slot.el.dataset.fill = `${ref.entryId}|fb|no preview`;
             }
             if (slot.el.hidden) slot.el.hidden = false;
@@ -1420,8 +1980,54 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       }
     };
 
+    // ------------------------------------------------- interior expansion
+    //
+    // The map recurses LAZILY to MAX_INTERIOR_DEPTH: the view supplies the
+    // interiors it already fetched through `expanded`, and this pass asks for
+    // the ones that can show real structure NOW. A folder is worth
+    // subdividing only when its projected tile clears EXPAND_MIN_AREA_PX (a
+    // smaller box would subdivide into slivers, not structure), it is
+    // on-screen, undimmed, shallower than the cap, and has no interior in
+    // `expanded` yet. Requests are capped at EXPAND_BATCH per DRAWN frame so
+    // a first paint cannot fan out into hundreds of IPC round-trips; the
+    // dedupe Set is the progress ledger — a folder is asked at most once per
+    // entries generation, whether the answer is children or the parent's
+    // memoised empty array (failure). An `expanded` arrival rebuilds the
+    // frame (ensureFrame identity) and the next draws ask for the newly
+    // revealed, still-large folders. Raw frame indices + scalar math + Set/
+    // Map lookups only: this pass allocates nothing in steady state.
+    const requestInteriors = () => {
+      const f = frame.current;
+      if (!f) return;
+      const need = p.current.onNeedExpand;
+      if (!need) return;
+      const asked = expandAsked.current;
+      const expanded = p.current.expanded;
+      const sc = vp.current.scale;
+      const tx0 = vp.current.tx;
+      const ty0 = vp.current.ty;
+      let issued = 0;
+      for (let i = 0; i < f.refs.length && issued < EXPAND_BATCH; i++) {
+        const ref = f.refs[i];
+        if (!ref.isDir || ref.depth >= MAX_INTERIOR_DEPTH) continue;
+        if (asked.has(ref.entryId) || expanded?.has(ref.entryId)) continue;
+        const t = f.tiles[i];
+        const w = t.w * sc;
+        const h = t.h * sc;
+        const x = tx0 + t.x * sc;
+        const y = ty0 + t.y * sc;
+        if (x > cssW.current || y > cssH.current || x + w < 0 || y + h < 0) continue;
+        if (dimmed(i)) continue;
+        if (w * h < EXPAND_MIN_AREA_PX) continue;
+        asked.add(ref.entryId);
+        need(ref.entryId);
+        issued++;
+      }
+    };
+
     const draw = () => {
       ensureFrame();
+      requestInteriors(); // right after the frame: the new frame's folders ask for interiors
       drawGL(true);
       updatePreviews(); // before drawLabels: suppression flags must be fresh
       drawLabels();
@@ -1436,7 +2042,11 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       try {
         const a = anim.current;
         if (a) {
-          const t = Math.min(1, (performance.now() - a.t0) / ZOOM_MS);
+          // prefers-reduced-motion collapses the duration to a cut — the
+          // same code path, so the invariants (enforceFill, hover re-resolve)
+          // still run, they just land on the target frame.
+          const dur = reducedMotion.current ? REDUCED_MS : durNav.current;
+          const t = Math.min(1, (performance.now() - a.t0) / dur);
           const k = ease(t);
           vp.current = {
             tx: a.from.tx + (a.to.tx - a.from.tx) * k,
@@ -1458,7 +2068,8 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
           }
         } else if (wheelTarget.current) {
           const target = wheelTarget.current;
-          const alpha = 0.18;
+          // reduced motion: no smoothing — snap to the accumulated target
+          const alpha = reducedMotion.current ? 1 : WHEEL_LERP;
           vp.current = enforceFill({
             scale: vp.current.scale + (target.scale - vp.current.scale) * alpha,
             tx: vp.current.tx + (target.tx - vp.current.tx) * alpha,
@@ -1501,7 +2112,21 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
     // above the floor; only its TARGET, fit, matters and fit == floor).
     const animateTo = (to: Viewport) => {
       vp.current = enforceFill(vp.current);
-      anim.current = { from: { ...vp.current }, to: enforceFill(to), t0: performance.now() };
+      const dest = enforceFill(to);
+      if (reducedMotion.current) {
+        // prefers-reduced-motion: the animation IS the destination. Same
+        // end state as the eased path (enforced viewport, hover re-resolved
+        // at the last known point so the tooltip names what is actually
+        // there), minus the 420ms of travel.
+        vp.current = dest;
+        wheelTarget.current = null;
+        anim.current = null;
+        const h = hoverLast.current;
+        if (!Number.isNaN(h.x)) resolveHover(h.x, h.y, false);
+        kick();
+        return;
+      }
+      anim.current = { from: { ...vp.current }, to: dest, t0: performance.now() };
       kick();
     };
 
@@ -1547,11 +2172,11 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       glCtx.current = gl;
       prog.current = createTileProgram(gl); // enables aA blending (see gl.ts)
 
-      // Preview plate pool (~24 nodes, pool 24 > cap 8 by design): appended
-      // to the static layer. React renders the layer empty and never touches
-      // a plate again — every later write (position/visibility/content) is
-      // imperative from the draw loop (updatePreviews). Plates leave the
-      // DOM with the layer.
+      // Preview plate pool (POOL nodes = VISIBLE_CAP, so every ranked-in
+      // candidate can carry content): appended to the static layer. React
+      // renders the layer empty and never touches a plate again — every
+      // later write (position/visibility/content) is imperative from the
+      // draw loop (updatePreviews). Plates leave the DOM with the layer.
       const layer = plateLayerRef.current;
       if (layer) {
         const pool: PlateSlot[] = [];
@@ -1749,6 +2374,18 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
         if (d.mode === "pending" && f && d.idx >= 0 && d.idx < f.refs.length) {
           const ref = f.refs[d.idx];
           const id = ref.entryId;
+          if (id < 0) {
+            // Layout aggregate ("17 more"): open the folder whose tail it
+            // summarizes. Drilling promotes that folder to depth 0, where its
+            // full child list lays out without the interior child cap.
+            const pid = ref.parentEntryId;
+            if (pid != null) {
+              const rect = findWorldRect(f, pid);
+              if (rect) p.current.onZoomCommit(pid, rect);
+            }
+            kick();
+            return;
+          }
           if (ref.isDir && !d.shift) {
             // Single click on a directory tile navigates into it (files still
             // select). Mirror of the double-click drill-in path.
@@ -1809,6 +2446,7 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
         const idx = hitTest(x, y);
         if (!f || idx < 0) return;
         const ref = f.refs[idx];
+        if (ref.entryId < 0) return; // aggregate: nothing to open
         if (ref.isDir) {
           const rect = findWorldRect(f, ref.entryId);
           if (rect) p.current.onZoomCommit(ref.entryId, rect);
@@ -1863,7 +2501,9 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
         const { x, y } = localPos(e as unknown as WheelEvent);
         const idx = hitTest(x, y);
         const f = frame.current;
-        p.current.onContextMenu(idx >= 0 && f ? f.refs[idx].entryId : null, e.clientX, e.clientY);
+        // Negative ids are layout aggregates, not entries: no context menu.
+        const id = idx >= 0 && f ? f.refs[idx].entryId : null;
+        p.current.onContextMenu(id !== null && id >= 0 ? id : null, e.clientX, e.clientY);
       };
 
       const onLeave = () => {
@@ -1916,19 +2556,46 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
         // drop the bookkeeping so a remount starts clean
         slots.current = [];
         slotOf.current.clear();
-        reqOnce.current.clear();
+        reqFirst.current.clear();
+        reqLast.current.clear();
       };
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    // entries / theme / previews arrive as props; rebuild lazily (the draw
-    // pipeline calls ensureFrame, and this kick guarantees a draw is
-    // scheduled). previews is in the list so a payload arrival re-runs
-    // updatePreviews even while the user holds still; theme also reloads
-    // the CSS palette (GL uniforms + marquee strings).
+    // prefers-reduced-motion, live: the same law the CSS layer enforces on
+    // its transitions (primitives.css clamps every duration to 0.01ms) for
+    // the JS viewport animations — the nav/zoom animation collapses to a
+    // cut and the wheel lerp snaps. One listener at mount, never a per-frame
+    // matchMedia query.
+    useEffect(() => {
+      const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+      const apply = () => {
+        reducedMotion.current = mq.matches;
+      };
+      apply();
+      mq.addEventListener("change", apply);
+      return () => mq.removeEventListener("change", apply);
+    }, []);
+
+    // entries / theme / previews / expanded arrive as props; rebuild lazily
+    // (the draw pipeline calls ensureFrame, and this kick guarantees a draw
+    // is scheduled). previews is in the list so a payload arrival re-runs
+    // updatePreviews even while the user holds still; expanded is there for
+    // the same reason — an interior arrival rebuilds the frame (ensureFrame
+    // identity) and must schedule the draw that paints it, even at rest.
+    // theme also reloads the CSS palette (GL uniforms + marquee strings).
     useEffect(() => {
       loadPalette();
     }, [props.theme]);
+
+    // Interior-expansion bookkeeping belongs to a NAVIGATION, exactly like
+    // the preview request generation: entryIds from the view we left must
+    // not suppress requests in the view we entered. Deliberately keyed on
+    // `entries` only — an `expanded` arrival is the ANSWER to a request, and
+    // clearing the Set for it would re-ask the same folders forever.
+    useEffect(() => {
+      expandAsked.current.clear();
+    }, [props.entries]);
 
     useEffect(() => {
       kick();
@@ -1939,6 +2606,7 @@ export const TreemapCanvas = forwardRef<TreemapHandle, TreemapCanvasProps>(
       props.hiddenCats,
       props.highlightIds,
       props.previews,
+      props.expanded,
     ]);
 
     useImperativeHandle(ref, (): TreemapHandle => ({

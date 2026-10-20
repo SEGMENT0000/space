@@ -156,7 +156,7 @@ pub struct PreviewPayload {
     pub media: Option<MediaPreview>,
 }
 
-/// TEXT family head: ≤64 KB read, ≤200 lines.
+/// TEXT family head: ≤64 KB read, ≤120 lines.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextPreview {
@@ -170,7 +170,7 @@ pub struct TextPreview {
     pub encoding: Option<String>,
 }
 
-/// IMAGE family: downscaled re-encode (longest edge ≤256 px, JPEG q≈80).
+/// IMAGE family: downscaled re-encode (longest edge ≤512 px, JPEG q≈80).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImagePreview {
@@ -214,11 +214,18 @@ pub struct ListEntry {
     pub size: Option<u64>,
     /// "dir" | "file"
     pub kind: String,
+    /// Archive compression method ("Store", "Deflate", "Bzip2", "Zstd", …);
+    /// omitted for folders and for listings without per-entry methods.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListPreview {
+    /// Listing source: "folder" | "zip" | "tar" | "iso" | "sheet".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub entries: Vec<ListEntry>,
     pub truncated: bool,
     /// Exact entry count when enumerated cheaply (≤50k names / central dir).
@@ -240,12 +247,21 @@ pub struct MetaPreview {
     pub pairs: Vec<MetaPair>,
 }
 
-/// DB family: table names + column counts only (no COUNT(*), never row data).
+/// DB family row — schema per table, plus the first rows of the leading
+/// tables via bounded `LIMIT` queries (never COUNT(*), never unbounded reads;
+/// cells are display-capped text, blobs render as a byte-size stub).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DbTable {
     pub name: String,
+    /// Column count (== `columns.len()` when columns were readable).
     pub cols: u32,
+    /// Column names in declaration order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<String>>,
+    /// First rows, cell-by-cell display text (only on the leading tables).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<Vec<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -270,6 +286,10 @@ pub struct MediaPreview {
     pub w: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub h: Option<u32>,
+    /// Cheaply parsed container facts (format/codec/channels/sample rate/
+    /// duration…) from real header bytes — only when a parse found any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pairs: Option<Vec<MetaPair>>,
 }
 
 /// Internal arena node. Not serialized.

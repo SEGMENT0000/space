@@ -2,32 +2,41 @@ import "../../styles/preview.css"; // plate styles live here (component-owned; i
 import { convertFileSrc, isTauri } from "@tauri-apps/api/core";
 // The app's single formatter module — no local byte/count/duration
 // formatting lives here; call sites adapt to its semantics, never the reverse.
-import { formatBytes, formatCount, formatElapsed } from "../../lib/format";
+import { formatBytes, formatCount, formatDuration, formatPercent } from "../../lib/format";
+// The eight-category palette: the META card's category row paints a keyed
+// swatch from here (hue on a swatch only — chrome stays grey, §2.4/R8).
+import { CATEGORY_LABELS, categoryStyle } from "../../lib/colors";
 
 // ---------------------------------------------------------------------------
-// In-tile preview plates — INS_BRIEF.md §2 (binding), restyled to the
-// instrument-panel world: a deep sunken chassis plate (radius --r-plate,
-// 0.5px hairline-strong edge, never a shadow) carrying per-family readout
-// beds over the WebGL tiles.
+// In-tile preview plates — INS_BRIEF.md §2 (binding): the shared frame is an
+// elevated, square, flat plate (--bg-elevated, radius 0, 0.5px hairline-
+// strong edge, never a shadow) carrying per-family readout beds over the
+// WebGL tiles.
 //
 // Pure DOM module: plates live in a `map-previews` overlay layer as pooled
 // nodes (~24), positioned imperatively by the draw loop. They never enter the
 // React render path and never scroll. All content is written via textContent
 // (no innerHTML) so file bytes can never inject markup into the map overlay.
 //
-// Export surface (byte-stable — the renderer codes against exactly this):
-//   createPlate()            → pooled `.tm-prev` root, hidden by default
-//   fillPlate(el, p, opts)   → rewrite content for one payload (idempotent)
-//   fillFallbackPlate(el, r) → honest unavailable state + real reason
+// Export surface (backwards compatible — the renderer codes against exactly
+// this; every new field is optional, no existing signature was broken):
+//   createPlate()                    → pooled `.tm-prev` root, hidden by default
+//   fillPlate(el, p, opts, meta?)    → rewrite content for one payload, else the
+//                                      fallback ladder (see the doc comment
+//                                      on fillPlate): family renderer → META
+//                                      card from tile metadata → honest dots
+//   fillFallbackPlate(el, r, meta?)  → honest unavailable state + real reason;
+//                                      with tile metadata it paints the
+//                                      step-2 metadata card instead
 //
 // The renderer owns visibility (hidden attr or inline display), positioning
 // (transform) and the --tile-w/--tile-h custom properties the frame math uses.
 // ---------------------------------------------------------------------------
 
-/** Structural mirror of the §B PreviewPayload DTO. Every field is optional so
- *  the frozen `src/lib/types.ts` shape stays assignable here regardless of
- *  which fields the Rust side marks required; ambiguous fields are `unknown`
- *  and normalized at render time. */
+/** Structural mirror of the §B PreviewPayload DTO (kept in sync with
+ *  `src/lib/types.ts` / the finalized model.rs). Every field is optional
+ *  here so an absent sub-object reads as "no payload" for the fallback
+ *  ladder; fields Rust never emits are not mirrored. */
 export interface PreviewPayload {
   family?: string;
   text?: PreviewText;
@@ -42,46 +51,68 @@ export interface PreviewMedia {
   path: string;
   mime: string;
   kind: "video" | "audio";
+  /** Real when cheaply parsed, absent (never guessed) otherwise — printed
+   *  in the head meta only when present (formatDuration clock stamp). */
   durationMs?: number;
   w?: number;
   h?: number;
+  /** Real parsed container facts (format/duration/codec/channels/sample
+   *  rate/…) — rendered in the meta kv rhythm below the head. */
+  pairs?: PreviewPair[];
 }
 export interface PreviewText {
-  /** Landed model.rs shape: one newline-joined string (split at render). */
-  content?: string;
-  /** Legacy/array shape, kept tolerant. */
+  /** Landed model.rs shape: the read head's lines, one array. */
   lines?: string[];
   truncated?: boolean;
+  /** Exact total only when the whole file was inside the 64 KB cap. */
   totalLines?: number;
-  /** BOM-detected encoding ("UTF-8", "UTF-16LE", …) — shown in header meta. */
+  /** BOM-detected encoding — "utf-8" | "utf-16le" | "utf-16be", shown in
+   *  the header meta uppercased (inherently-upper data). */
   encoding?: string;
 }
 export interface PreviewImage {
   dataUrl?: string;
+  /** ORIGINAL source dimensions (the dataUrl is the ≤512px re-encode). */
   w?: number;
   h?: number;
   mime?: string;
 }
 export interface PreviewHexRow {
-  off?: number | string;
-  bytes?: number[] | string;
+  off?: number;
+  /** Space-separated lowercase hex, 8 bytes per row from Rust. */
+  bytes?: string;
+  /** Printable ASCII (0x20..=0x7E) or "·" — one glyph per byte. */
   ascii?: string;
 }
 export interface PreviewHex {
   rows?: PreviewHexRow[];
+  /** Always 0 (no seek offset server-side). */
   base?: number;
+  /** Total file size in bytes. */
   total?: number;
 }
 export interface PreviewListEntry {
   name?: string;
-  size?: number | string;
+  /** File byte size; omitted for directories (subtree size needs a walk). */
+  size?: number;
+  /** "dir" | "file". */
   kind?: string;
-  method?: string; // archive listing only ("method-if-present" §2.3)
+  /** Archive compression method ("Store" | "Deflate" | "Bzip2" | "Zstd" |
+   *  …) on zip file rows only; tar file rows are "Store"; folder/ISO/
+   *  sheet and dir rows omit it. */
+  method?: string;
 }
 export interface PreviewList {
   entries?: PreviewListEntry[];
   truncated?: boolean;
+  /** Listing source: "folder" | "zip" | "tar" | "iso" | "sheet". */
   kind?: string;
+  /** Exact entry count when enumerated cheaply. */
+  total?: number;
+  /** Folder cards: wrapper directories descended through before the rendered
+   *  rows (e.g. ["User Data"] for Chrome). Named in the head meta so the rows
+   *  are never mistaken for the folder's direct children. */
+  via?: string[];
 }
 export interface PreviewMeta {
   pairs?: PreviewPair[];
@@ -92,12 +123,62 @@ export interface PreviewPair {
 }
 export interface PreviewDbTable {
   name?: string;
-  cols?: unknown; // number | string[] | {name,…}[] from the backend — count it
-  rows?: number;
+  /** Column count (== columns.len() when the columns were readable). */
+  cols?: number;
+  /** Column names in declaration order (leading tables only). */
+  columns?: string[];
+  /** First ≤5 rows as cell display text — display-capped, blobs stubbed,
+   *  null rendered honestly by the backend; the plate passes text through. */
+  rows?: string[][];
 }
 export interface PreviewDb {
   tables?: PreviewDbTable[];
   truncated?: boolean;
+}
+
+/** Tile metadata — the plate contract's `meta?`. Everything the renderer
+ *  knows about a tile WITHOUT a payload, so a card can always be built:
+ *  name, type from ext, category, size, share of parent (§2.4 geometry).
+ *  Every field optional; a caller may hand over its whole tile-ref object.
+ *  The index signature keeps a ref carrying extra fields (depth, ids, …)
+ *  assignable as an object literal — rows are only ever built for fields
+ *  that are actually present, never for the extras. */
+export interface PlateMeta {
+  /** file/folder name as the tile shows it */
+  name?: string;
+  /** bytes */
+  size?: number;
+  isDir?: boolean;
+  /** category index into CATEGORY_LABELS (0..7) */
+  cat?: number;
+  /** extension without the dot ("png") — type row source; falls back to the
+   *  extension parsed from `name` when absent */
+  ext?: string;
+  /** frame total in bytes — the share-of-parent denominator */
+  parentSize?: number;
+  [key: string]: unknown;
+}
+
+/** The plate box the draw loop qualifies/fills at (raw tile px, or the
+ *  canvas-clamped painted box + the 8px inset — same units the CSS calc
+ *  subtracts back out). */
+export interface PlateTile {
+  w: number;
+  h: number;
+}
+
+/** Options for fillPlate. `meta` (tile metadata) and `parentSize` are new
+ *  and optional; fileName/theme/tile keep their exact previous types, so
+ *  every existing call site compiles and behaves unchanged. */
+export interface FillPlateOptions {
+  fileName?: string;
+  theme: "light" | "dark";
+  tile: PlateTile;
+  /** tile metadata for the fallback ladder — see PlateMeta */
+  meta?: PlateMeta;
+  /** share-of-parent denominator (frame total, bytes), when the caller keeps
+   *  it beside the tile rather than inside `meta` */
+  parentSize?: number;
 }
 
 interface Box {
@@ -142,20 +223,19 @@ function measureRoot<T>(root: HTMLElement, read: () => T): T {
   return v;
 }
 
-// Byte/count/duration formatting is imported from lib/format.ts — the app's
-// single formatter module: formatBytes for sizes, formatCount for counts,
-// formatElapsed for durations. Its magnitude semantics (adaptive digits,
-// "N B" under 1024) are the contract; call sites adapt to it, never the
-// reverse. formatCount stays locale-fixed ("en-US") so pooled plates are
+// Byte/count/duration/percent formatting is imported from lib/format.ts —
+// the app's single formatter module: formatBytes for sizes, formatCount for
+// counts, formatDuration for media durations (clock stamp), formatPercent
+// for the share-of-parent fraction. Its magnitude semantics (adaptive
+// digits, "N B" under 1024) are the contract; call sites adapt to it,
+// never the reverse.
+// formatCount stays locale-fixed ("en-US") so pooled plates are
 // deterministic across machines.
 
-/** Adapter over formatBytes for the tolerant DTO size field: a number,
- *  a numeric string, or a preformatted string that passes through. */
-function fmtSize(v: number | string | undefined): string {
-  if (v == null) return "";
-  if (typeof v === "number") return formatBytes(v);
-  const s = v.trim();
-  return /^\d+$/.test(s) ? formatBytes(parseInt(s, 10)) : s;
+/** Adapter over formatBytes for the DTO size field (u64 bytes when the
+ *  backend had one; absent → "" so the cell is empty, never a placeholder). */
+function fmtSize(v: number | undefined): string {
+  return v == null ? "" : formatBytes(v);
 }
 
 /** Numbers/units right-align to the common axis; paths & stamps stay left
@@ -206,23 +286,13 @@ function asciiOf(bytes: number[]): string {
   return s;
 }
 
-function parseOff(off: number | string | undefined): number {
-  if (typeof off === "number") return num(off);
-  if (typeof off !== "string") return 0;
-  const s = off.trim().replace(/^0x/i, "");
-  if (!s) return 0;
-  const v = /[a-fA-F]/.test(s) ? parseInt(s, 16) : parseInt(s, 10);
-  return isFinite(v) && v > 0 ? v : 0;
+function parseOff(off: number | undefined): number {
+  return typeof off === "number" && isFinite(off) && off > 0 ? Math.floor(off) : 0;
 }
 
-/** Tolerates `number[]`, `"4d 5a …"` and a single packed hex run. Unparseable
+/** Rust sends space-separated lowercase hex ("4d 5a 90 00"). Unparseable
  *  input → [] which yields NO signature annotation (never guess bytes). */
-function toBytes(raw: number[] | string | undefined): number[] {
-  if (Array.isArray(raw)) {
-    const out: number[] = [];
-    for (const b of raw) if (typeof b === "number" && isFinite(b)) out.push(b & 0xff);
-    return out;
-  }
+function toBytes(raw: string | undefined): number[] {
   if (typeof raw !== "string") return [];
   const out: number[] = [];
   for (let tok of raw.trim().split(/\s+/)) {
@@ -308,22 +378,98 @@ function footer(moreCls: string, noun: string, hidden: number, payloadMore: bool
 
 // ------------------------------------------------------------- families ---
 
-/** TEXT (§2.1): numbered grid, greyscale syntax, reserved 16px footer band. */
-function renderText(body: HTMLElement, tx: PreviewText, box: Box): string {
+/** Family render gates (§2.0 table, px): below a family's gate it is NOT
+ *  rendered — the plate steps down the fallback ladder instead (tile-
+ *  metadata META card → honest dots state). Mirrored here rather than
+ *  trusted from the qualify step because the painted box is canvas-clamped:
+ *  a partially off-canvas tile can pass the qualify gate on its raw size
+ *  and land under the family gate at fill time. Rows are computed from the
+ *  real painted pixels, never from the raw tile. */
+const FAMILY_GATE: Record<string, readonly [number, number]> = {
+  text: [160, 118],
+  image: [120, 92],
+  list: [180, 120],
+  db: [180, 120],
+  meta: [120, 92],
+  hex: [330, 140],
+  media: [240, 120],
+};
+
+/** §2.4 proportion cap for the META family (payload cards AND the fallback
+ *  metadata card): a metadata card is a readout, not a sheet — past
+ *  460×340 it reads as an empty box (live shot: pagefile.sys at ~720×600
+ *  carrying five short rows). Mirrored by the `[data-family="meta"]`
+ *  max-width/max-height rule in preview.css — the element clamps there,
+ *  this clamp keeps the row/head-tier math on the same painted box;
+ *  BOTH must change together. The plate's top/left anchor (the 4px
+ *  inset) and the family gates are untouched: the cap only ever trims a
+ *  plate that already qualified. No other family is capped (LIST/DB are
+ *  bounded by the canvas; the rest fill their box by nature). */
+const META_CAP_W = 460;
+const META_CAP_H = 340;
+
+/** Payload presence for the ladder: a sub-object only "exists" when it can
+ *  actually produce rows. A tagged family with an empty sub-object is
+ *  data-less — it steps down the ladder rather than painting an empty bed
+ *  (the ladder's never-an-empty-state rule). */
+function usableText(tx: PreviewText | undefined): boolean {
+  return !!tx && Array.isArray(tx.lines);
+}
+function usableHex(hx: PreviewHex | undefined): boolean {
+  return !!hx && Array.isArray(hx.rows) && hx.rows.length > 0;
+}
+function usableList(ls: PreviewList | undefined): boolean {
+  return !!ls && Array.isArray(ls.entries) && ls.entries.length > 0;
+}
+function usableDb(db: PreviewDb | undefined): boolean {
+  return !!db && Array.isArray(db.tables) && db.tables.length > 0;
+}
+function usableMeta(mp: PreviewMeta | undefined): boolean {
+  return !!mp && Array.isArray(mp.pairs) && mp.pairs.length > 0;
+}
+
+/** Ladder step 1 — pick the family renderer, or "" when no sub-object is
+ *  renderable. Family tag first (§A discriminant; svg→text, none→meta via
+ *  the content rescue), then the content-driven rescue when the tag is
+ *  missing/unknown. Never guesses a family the payload doesn't carry. */
+function resolvePlan(payload: PreviewPayload, fam: string): string {
+  if ((fam === "TEXT" || fam === "SVG") && usableText(payload.text)) return "text";
+  if (fam === "HEX" && usableHex(payload.hex)) return "hex";
+  if (fam === "IMAGE" && payload.image) return "image";
+  if (fam === "LIST" && usableList(payload.list)) return "list";
+  if (fam === "DB" && (usableDb(payload.db) || usableList(payload.list))) {
+    return usableDb(payload.db) ? "db" : "list";
+  }
+  if (fam === "META" && usableMeta(payload.meta)) return "meta";
+  if (fam === "MEDIA" && payload.media) return "media";
+  // content-driven rescue when the family tag is missing/unknown
+  if (usableText(payload.text)) return "text";
+  if (usableHex(payload.hex)) return "hex";
+  if (payload.image) return "image";
+  if (usableDb(payload.db)) return "db";
+  if (usableList(payload.list)) return "list";
+  if (usableMeta(payload.meta)) return "meta";
+  if (payload.media) return "media";
+  return "";
+}
+
+/** TEXT (§2.1): numbered grid, greyscale syntax, reserved 16px footer band.
+ *  `sizeStr` is the tile's real byte size (header meta: `UTF-8 · 4.2 KB ·
+ *  128 L` — every field real or omitted). Returns null when the payload
+ *  carries no line to number: the ladder steps down instead of painting
+ *  an empty bed. */
+function renderText(body: HTMLElement, tx: PreviewText, box: Box, sizeStr: string): string | null {
   body.className = "tm-prev__body tm-text";
-  // Landed Rust sends `content` (one newline-joined string); keep `lines[]`
-  // tolerated so either payload shape renders identically.
-  const lines = Array.isArray(tx.lines)
-    ? tx.lines
-    : typeof tx.content === "string"
-      ? tx.content.split(/\r?\n/)
-      : [];
+  // Landed Rust shape: `lines[]` straight from the read head.
+  const lines = Array.isArray(tx.lines) ? tx.lines : [];
   const total =
     typeof tx.totalLines === "number" && tx.totalLines >= lines.length ? tx.totalLines : null;
   const payloadMore = tx.truncated === true && total === null; // held head only
   const visible = Math.max(0, Math.floor((box.h - 16) / 16)); // §2.0 formula
   const rendered = Math.min(lines.length, visible);
   const hidden = Math.max(0, (total ?? lines.length) - rendered);
+  // Nothing to number and nothing withheld → no bed to paint (ladder step 2)
+  if (rendered === 0 && hidden === 0 && !payloadMore) return null;
 
   const grid = h("div", "tm-text__grid");
   // gutter width fixed once per fill: max(3ch, digits of last visible line) + 14px
@@ -343,18 +489,21 @@ function renderText(body: HTMLElement, tx: PreviewText, box: Box): string {
   // in the mono meta voice; every field shown is one we truly have.
   const enc =
     typeof tx.encoding === "string" && tx.encoding ? tx.encoding.toUpperCase() + " · " : "";
-  return `${enc}${formatCount(total ?? lines.length)} L`;
+  const size = sizeStr ? sizeStr + " · " : "";
+  return `${enc}${size}${formatCount(total ?? lines.length)} L`;
 }
 
 /** HEX (§2.1): sunken bed, re-chunked 8/16 bytes per row, single hairline
- *  between hex and ascii, real signature bytes only. */
+ *  between hex and ascii, real signature bytes only. Returns null when no
+ *  byte row survives parsing — the ladder steps down rather than painting
+ *  an empty dump (unparseable input never becomes an annotation either). */
 function renderHex(
   body: HTMLElement,
   hx: PreviewHex,
   box: Box,
   tileW: number,
   root: HTMLElement
-): string {
+): string | null {
   body.className = "tm-prev__body tm-hex";
   const src = Array.isArray(hx.rows) ? hx.rows : [];
   const per = tileW < 420 ? 8 : 16; // §2.1 density rule
@@ -369,6 +518,7 @@ function renderHex(
   }
   const visible = Math.max(0, Math.floor((box.h - 16) / 16)); // bed padding 8 + 8
   const shown = runs.slice(0, visible);
+  if (!shown.length) return null; // no real bytes → no dump (ladder step 2)
   const sig = shown.length ? matchSignature(shown[0].bytes) : null;
   let note: HTMLElement | null = null;
   let row0: HTMLElement | null = null;
@@ -390,7 +540,6 @@ function renderHex(
     }
     body.append(row);
   }
-  if (!shown.length) return "HEX";
   // The note is the signature's text key (Two-Channel): when the dump row
   // outruns the plate it would clip mid-glyph — cut it whole instead. The
   // sig bytes themselves keep their accent-soft mark either way.
@@ -425,13 +574,21 @@ function renderImage(
   box: Box,
   tileW: number,
   fileName: string,
-  root: HTMLElement
+  root: HTMLElement,
+  sizeStr: string
 ): string {
+  // head meta: extension + real byte size, every field or none (§2.2
+  // example `PNG · 842 KB · sRGB` — no sRGB field exists in the payload,
+  // so it is omitted rather than assumed)
+  const head = (): string => {
+    const ex = extOf(fileName, im.mime);
+    return ex && sizeStr ? `${ex} · ${sizeStr}` : ex || sizeStr;
+  };
   body.className = "tm-prev__body tm-img";
   const src = im.dataUrl; // narrow once — property narrowing could lapse below
   if (!src) {
     renderFailed(body, "no image data");
-    return extOf(fileName, im.mime);
+    return head();
   }
   const big = tileW >= 160;
   const frame = h("div", big ? "tm-img__frame crop" : "tm-img__frame");
@@ -470,36 +627,31 @@ function renderImage(
     renderFailed(body, "decode error");
   });
   img.src = src;
-  return extOf(fileName, im.mime); // header meta: one real field, or none
+  return head(); // header meta: real fields only
 }
 
 function str(v: unknown): string {
   return v == null ? "" : String(v);
 }
 
-function colCount(cols: unknown): number | null {
-  if (typeof cols === "number" && isFinite(cols)) return cols;
-  if (Array.isArray(cols)) return cols.length;
-  return null;
-}
-
 /** §2.3 column presets built from what the payload actually carries:
- *  archive-with-methods `1fr 5ch 7ch`, db `1fr 7ch 7ch`, else `1fr 7ch`.
- *  A method/column that no entry has is dropped instead of shipping an
- *  always-empty track (honest "if-present"). The 7ch value track is the
- *  width of formatBytes' widest output ("99.9 KB"), so a size cell is
- *  always fully visible — the §2.3 preset's 6ch predates that formatter. */
+ *  archive-with-methods `1fr 7ch 7ch`, else `1fr 7ch`. A method that no
+ *  entry has is dropped instead of shipping an always-empty track (honest
+ *  "if-present"); the landed backend fills `method` on zip file rows, so
+ *  the track lights up exactly when real methods exist. The 7ch value
+ *  tracks are the width of formatBytes' widest output ("99.9 KB") and the
+ *  widest method word ("Deflate"), so every cell is always fully visible —
+ *  the §2.3 preset's 6ch predates that formatter. */
 function listCols(list: PreviewList): Cols {
   const entries = Array.isArray(list.entries) ? list.entries : [];
   const kind = typeof list.kind === "string" ? list.kind : "";
-  const isArchive = kind === "archive";
-  const labels = [isArchive ? "name" : kind === "db" ? "table" : "name"];
+  const labels = [kind === "db" ? "table" : "name"];
   const widths = ["1fr"];
   const numeric = [false];
   const hasMethod = entries.some((e) => str(e.method).trim() !== "");
-  if (isArchive && hasMethod) {
+  if (hasMethod) {
     labels.push("method");
-    widths.push("5ch");
+    widths.push("7ch");
     numeric.push(false);
   }
   const hasSize = entries.some((e) => e.size != null && str(e.size).trim() !== "");
@@ -509,41 +661,139 @@ function listCols(list: PreviewList): Cols {
     numeric.push(true);
   }
   const rows = entries.map((e) => {
-    const cells = [str(e.name)];
-    if (isArchive && hasMethod) cells.push(str(e.method));
+    const name = str(e.name);
+    // A trailing slash is the cheapest real kind channel: folder rows and
+    // archive directory rows read as containers without a second column.
+    const cells = [str(e.kind) === "dir" ? `${name}/` : name];
+    if (hasMethod) cells.push(str(e.method));
     if (hasSize) cells.push(fmtSize(e.size));
     return cells;
   });
   return { labels, widths, numeric, rows };
 }
 
-function dbCols(db: PreviewDb): Cols {
+/** DB (§2.3): schema list on top (table · columns), then — when the payload
+ *  carries real rows — a dense grid per contributing table: declaration-
+ *  order column headers + the delivered rows as display-text cells. Every
+ *  section is computed from the plate's real pixel height; the grid only
+ *  draws when header + ≥1 row fit beside the schema, cuts are honest (one
+ *  `…` footer carries withheld rows/tables and payload truncation). Cells
+ *  never wrap, never scroll; a 24-column cap keeps a wide table a glimpse.
+ *  The old rows-count column is gone with the DTO: row counts are not a
+ *  schema fact, so the schema section shows table · columns only. */
+const DB_GRID_COL_CAP = 24;
+const DB_SCHEMA_CAP = 5; // schema rows when a grid shares the body
+
+function renderDb(body: HTMLElement, db: PreviewDb, box: Box): string {
+  body.className = "tm-prev__body tm-list tm-db";
   const tables = Array.isArray(db.tables) ? db.tables : [];
-  const labels = ["table"];
-  const widths = ["1fr"];
-  const numeric = [false];
-  const hasCols = tables.some((t) => colCount(t.cols) != null);
-  const hasRows = tables.some((t) => typeof t.rows === "number");
-  if (hasCols) {
-    labels.push("columns");
-    widths.push("7ch");
-    numeric.push(true);
+  const truncated = db.truncated === true;
+  // contributing tables: those the backend actually queried rows for
+  const groups = tables.filter((t) => Array.isArray(t.rows) && (t.rows as string[][]).length > 0);
+  let delivered = 0;
+  for (const t of groups) delivered += (t.rows as string[][]).length;
+
+  // ---- pixel budget. One 16px footer band is always reserved: any cut or
+  // a payload-declared truncation needs it, and never reflowing after fill
+  // is worth the spare band on a fully-fitting plate.
+  const hasGrid = groups.length > 0;
+  const multi = groups.length > 1; // per-table name bands
+  const gridFixed = groups.length * (16 + (multi ? 16 : 0)); // header (+ name) per group
+  const gridMin = 16 + 18 + (multi ? 16 : 0); // header + one row (+ name)
+  let schemaRows = Math.min(tables.length, hasGrid ? DB_SCHEMA_CAP : TABLE_ROW_CAP);
+  if (hasGrid) {
+    const maxSchemaPx = box.h - gridMin - 16;
+    schemaRows = Math.min(schemaRows, Math.max(0, Math.floor((maxSchemaPx - 16) / 22)));
+  } else {
+    schemaRows = Math.min(schemaRows, Math.max(0, Math.floor((box.h - 32) / 22)));
   }
-  if (hasRows) {
-    labels.push("rows");
-    widths.push("7ch");
-    numeric.push(true);
-  }
-  const rows = tables.map((t) => {
-    const cells = [str(t.name)];
-    if (hasCols) {
-      const c = colCount(t.cols);
-      cells.push(c == null ? "" : formatCount(c));
+  const schemaPx = schemaRows > 0 ? 16 + schemaRows * 22 : 0;
+  const gridSpace = hasGrid ? Math.max(0, box.h - schemaPx - 16) : 0;
+
+  // ---- schema section (top)
+  if (schemaRows > 0) {
+    const sect = h("div", "tm-db__schema");
+    sect.style.setProperty("--cols", "1fr 7ch");
+    const keys = h("div", "tm-list__keys");
+    keys.append(h("span", "tm-list__key", "table"), h("span", "tm-list__key is-num", "columns"));
+    sect.append(keys);
+    for (let i = 0; i < schemaRows; i++) {
+      const t = tables[i];
+      const row = h("div", "tm-list__row");
+      row.append(
+        h("span", "tm-list__name", str(t.name)),
+        h("span", "tm-list__val", typeof t.cols === "number" ? formatCount(t.cols) : "")
+      );
+      sect.append(row);
     }
-    if (hasRows) cells.push(typeof t.rows === "number" ? formatCount(t.rows) : "");
-    return cells;
-  });
-  return { labels, widths, numeric, rows };
+    body.append(sect);
+  }
+
+  // ---- rows grid (bottom): groups in payload order until the pixels run
+  // out; a group that cannot fit its header + one row is dropped whole.
+  let rowsShown = 0;
+  let budget = Math.max(0, gridSpace - gridFixed);
+  if (hasGrid && budget >= 18) {
+    const grid = h("div", "tm-db__grid");
+    for (const t of groups) {
+      const fixed = 16 + (multi ? 16 : 0); // header (+ name band)
+      if (budget < fixed + 18) break; // this and every later group is cut
+      const colsAll = Array.isArray(t.columns) ? t.columns.slice(0, DB_GRID_COL_CAP) : [];
+      const rawRows = Array.isArray(t.rows) ? (t.rows as string[][]) : [];
+      const rowsAll = rawRows.map((r) => (Array.isArray(r) ? r.slice(0, DB_GRID_COL_CAP) : []));
+      // column count: header truth, else the widest delivered row — never
+      // invented; a rows payload with neither headers nor cells is not a grid
+      let nCols = colsAll.length;
+      for (const r of rowsAll) if (r.length > nCols) nCols = r.length;
+      if (nCols === 0) break;
+      const grp = h("div", "tm-db__group");
+      grp.style.setProperty("--grid-cols", `repeat(${nCols}, minmax(0, 1fr))`);
+      if (multi) grp.append(h("div", "tm-db__tname", str(t.name)));
+      if (colsAll.length > 0) {
+        const head = h("div", "tm-db__head");
+        for (const c of colsAll) head.append(h("span", "tm-db__cell is-key", c));
+        grp.append(head);
+        budget -= 16;
+      }
+      const fitRows = Math.min(rowsAll.length, Math.floor(budget / 18));
+      for (let i = 0; i < fitRows; i++) {
+        const row = h("div", "tm-db__row");
+        const cells = rowsAll[i];
+        for (let c = 0; c < nCols; c++) row.append(h("span", "tm-db__cell", cells[c] ?? ""));
+        grp.append(row);
+      }
+      budget -= fitRows * 18;
+      rowsShown += fitRows;
+      grid.append(grp);
+      if (fitRows < rowsAll.length) break; // pixels gone: remaining groups fully cut
+    }
+    if (grid.childNodes.length > 0) body.append(grid);
+  }
+
+  // ---- honest footer: what THIS plate withheld + the payload's own lower bound
+  const schemaCut = tables.length - schemaRows;
+  const rowsCut = delivered - rowsShown;
+  if (schemaCut > 0 || rowsCut > 0 || truncated) {
+    const f = h("div", "tm-list__more");
+    f.append(document.createTextNode("… "));
+    if (schemaCut > 0) {
+      f.append(h("span", "num", formatCount(schemaCut) + (truncated ? "+" : "")));
+      f.append(document.createTextNode(` more ${noun1("tables", schemaCut)}`));
+      if (rowsCut > 0) f.append(document.createTextNode(" · "));
+    }
+    if (rowsCut > 0) {
+      f.append(h("span", "num", formatCount(rowsCut) + (truncated ? "+" : "")));
+      f.append(document.createTextNode(` more ${noun1("rows", rowsCut)}`));
+    }
+    if (schemaCut === 0 && rowsCut === 0) {
+      f.append(document.createTextNode("more tables")); // truncated, counts unknowable
+    }
+    body.append(f);
+  }
+  // head meta: delivered facts only — the table count and how many real
+  // rows the payload handed us (some may be cut from display by pixels).
+  return `${formatCount(tables.length)} ${noun1("tables", tables.length)}` +
+    (delivered > 0 ? ` · ${formatCount(delivered)} rows` : "");
 }
 
 /** LIST/DB (§2.3): 22px rows from actual body pixels, key strip only when
@@ -628,55 +878,114 @@ function railDatum(pairs: PreviewPair[]): string {
   return fmt || sig;
 }
 
-function kvRow(pair: PreviewPair): HTMLElement {
+/** §2.4: names/paths NEVER right-align, even when the name happens to be
+ *  all digits — "2024" is still a name, not a figure. */
+const LEFT_KEY_RE = /^(?:name|file name|filename|path|directory|folder|source|target)$/i;
+const CAT_KEY_RE = /^category$/i;
+
+function kvRow(pair: PreviewPair, theme: "light" | "dark"): HTMLElement {
   const kv = h("div", "tm-meta__kv");
   const key = str(pair.k);
   const raw = str(pair.v).trim();
   kv.append(h("span", "tm-meta__k", key));
   const v = h("span", "tm-meta__v");
-  if (isNumValue(raw)) v.classList.add("is-num"); // numbers right, strings left
-  if (WARN_KEY_RE.test(key) || WARN_VAL_RE.test(raw)) v.classList.add("tm-warn");
-  if (EMPTY_VALUES.includes(raw.toLowerCase())) {
-    // §2.4 unknown: keyed swatch + word, never a bare em-dash
-    v.append(h("span", "tex-hatch tm-meta__swatch"), document.createTextNode("unknown"));
-  } else if (FLAG_RE.test(raw)) {
-    v.append(h("span", "kbd tm-meta__flag", raw)); // chip geometry from .kbd
+  const catIdx = CAT_KEY_RE.test(key)
+    ? CATEGORY_LABELS.findIndex((lb) => lb.toLowerCase() === raw.toLowerCase())
+    : -1;
+  if (catIdx >= 0) {
+    // Two-Channel (R6/R9): the category hue rides a keyed swatch, the word
+    // carries the meaning. Hues live only on swatches — chrome stays grey.
+    const sw = h("span", "tm-meta__swatch");
+    sw.style.background = categoryStyle(catIdx, theme).css;
+    v.append(sw, document.createTextNode(raw));
   } else {
-    v.textContent = raw;
+    // numbers right, strings/paths left — never right-align a path (§2.4)
+    if (!LEFT_KEY_RE.test(key) && isNumValue(raw)) v.classList.add("is-num");
+    if (WARN_KEY_RE.test(key) || WARN_VAL_RE.test(raw)) v.classList.add("tm-warn");
+    if (EMPTY_VALUES.includes(raw.toLowerCase())) {
+      // §2.4 unknown: keyed swatch + word, never a bare em-dash
+      v.append(h("span", "tex-hatch tm-meta__swatch"), document.createTextNode("unknown"));
+    } else if (FLAG_RE.test(raw)) {
+      v.append(h("span", "kbd tm-meta__flag", raw)); // chip geometry from .kbd
+    } else {
+      v.textContent = raw;
+    }
   }
   kv.append(v);
   return kv;
 }
 
 /** META (§2.4): padded readout, one hero `.stat` capped at the 21px scale
- *  unless tile-w ≥ 360, kv rows carved by hairlines, optional right-edge
- *  rail carrying ONE live datum. */
+ *  unless tile-w ≥ 320 (30px tier), kv rows carved by hairlines, optional
+ *  right-edge rail carrying ONE live datum (`withRail: false` for cards
+ *  built from tile metadata — the rail's datum candidates belong to parsed
+ *  payloads, and a rail repeating a visible row would be decoration).
+ *
+ *  Returns the HEAD META string — the share only ("24%"): the hero stat
+ *  owns the size, so the size figure appears exactly ONCE on the card
+ *  (live shot had it three times: head, hero, kv row). A payload `share`
+ *  pair is moved up to the head verbatim and dropped from the rows; with
+ *  no share pair the head stays empty — a caller with a real denominator
+ *  (fillPlate) may compute one; this function never does. */
 function renderMeta(
   body: HTMLElement,
   mp: PreviewMeta,
   box: Box,
   tileW: number,
   tileH: number,
-  root: HTMLElement
+  root: HTMLElement,
+  theme: "light" | "dark",
+  withRail = true
 ): string {
   body.className = "tm-prev__body tm-meta";
   const pairs = Array.isArray(mp.pairs) ? mp.pairs : [];
-  const heroIdx = pairs.findIndex(
+  // Degraded card (§2.4 honesty): a `note` pair FIRST carries the verbatim
+  // backend reason ("symlink" | "unsupported" | "access denied" |
+  // "file in use") — rendered as the card's leading reason line, --ink-2, carved
+  // by a hairline. A note anywhere else stays an ordinary kv row (pair
+  // order is preserved as received); an empty note value is absent.
+  const note =
+    pairs.length > 0 && /^note$/i.test(str(pairs[0].k).trim()) ? str(pairs[0].v).trim() : "";
+  const base = note ? pairs.slice(1) : pairs;
+  const heroIdx = base.findIndex(
     (pr) => /^size$/i.test(str(pr.k)) && SIZE_LOOKS_RE.test(str(pr.v))
   );
-  const hero = heroIdx >= 0 ? pairs[heroIdx] : null;
-  const rest = heroIdx >= 0 ? pairs.filter((_, i) => i !== heroIdx) : pairs;
+  const hero = heroIdx >= 0 ? base[heroIdx] : null;
+  const heroVal = hero ? str(hero.v).trim() : "";
+  // §2.4 de-duplication (size figure appears once; share rides the head):
+  //  - a later `size` pair is dropped ONLY when it repeats the hero's
+  //    exact value — a different size value is a distinct datum and stays;
+  //  - the first non-empty `share` pair moves up to the head meta and
+  //    leaves the rows (an empty share pair keeps rendering its honest
+  //    "unknown" swatch, as any empty value does).
+  let headShare = "";
+  const rest: PreviewPair[] = [];
+  for (let i = 0; i < base.length; i++) {
+    if (i === heroIdx) continue;
+    const pr = base[i];
+    const k = str(pr.k).trim();
+    const v = str(pr.v).trim();
+    if (v !== "" && /^share$/i.test(k)) {
+      if (!headShare) headShare = v;
+      continue;
+    }
+    if (hero && /^size$/i.test(k) && v === heroVal) continue;
+    rest.push(pr);
+  }
 
-  // §2.4 as amended: the 30px hero tier opens at tile-w ≥ 360 — the
-  // oversized "186.1 MB" figure on mid-size tiles was the defect. Below
-  // the tier the hero reads at the plain 21px `.stat` scale.
-  const heroBig = tileW >= 360;
+  // §2.4: the 30px hero tier opens at tile-w ≥ 320 — the same boundary as
+  // the 28px head, so one refill covers both tiers. Below it the hero
+  // reads at the plain 21px `.stat` scale.
+  const heroBig = tileW >= 320;
   const heroH = hero ? (heroBig ? 51 : 41) : 0; // micro 15 + gap 3 + stat-v 23/33
   const sep = hero && rest.length > 0 ? 12 : 0; // flex gap 3 + hairline 1 + pad 8
-  const avail = box.h - 16 - heroH - sep; // plate padding 8×2
+  const noteH = note ? 25 : 0; // 18px line + 6px pad + 1px hairline
+  const avail = box.h - 16 - heroH - sep - noteH; // plate padding 8×2
   const full = Math.floor(avail / 18);
   const needsFooter = rest.length > full;
   const rows = Math.max(0, Math.min(rest.length, Math.floor((avail - (needsFooter ? 16 : 0)) / 18)));
+
+  if (note) body.append(h("div", "tm-meta__reason", note));
 
   if (hero) {
     const sect = h("div", "tm-meta__sect");
@@ -696,7 +1005,7 @@ function renderMeta(
   }
   if (rows > 0) {
     const sect = h("div", "tm-meta__sect");
-    for (let i = 0; i < rows; i++) sect.append(kvRow(rest[i]));
+    for (let i = 0; i < rows; i++) sect.append(kvRow(rest[i], theme));
     body.append(sect);
   }
   if (needsFooter) body.append(footer("tm-meta__more", "fields", rest.length - rows, false));
@@ -705,7 +1014,7 @@ function renderMeta(
   // must be real, and it must fit the rail's full length EXACTLY — measure
   // once at fill time and cut the rail whole otherwise (never clipped
   // mid-glyph; a clipped annotation is a lie).
-  if (tileW >= 360 && tileH >= 240) {
+  if (withRail && tileW >= 360 && tileH >= 240) {
     const datum = railDatum(pairs);
     if (datum) {
       const rail = h("div", "tm-meta__rail");
@@ -720,7 +1029,96 @@ function renderMeta(
       }
     }
   }
-  return ""; // META header meta: no field we truly have → omit (§2.0 rule)
+  return headShare; // head meta: the share only — the hero owns the size (§2.4)
+}
+
+// ------------------------------------------- tile-metadata card (step 2) ---
+
+/** Ladder step 2 gate: is there at least one REAL field to build a card
+ *  from? Absent/empty fields never count — a card is built from what we
+ *  were given, or not at all. */
+function hasTileMeta(m: PlateMeta | null): boolean {
+  if (!m) return false;
+  if (typeof m.name === "string" && m.name.trim() !== "") return true;
+  // same predicate tileMetaPairs uses — a field that would be OMITTED from
+  // the card must not qualify the card either (never an empty state)
+  if (typeof m.size === "number" && isFinite(m.size) && m.size >= 0) return true;
+  if (typeof m.ext === "string" && m.ext.trim() !== "") return true;
+  if (m.isDir === true) return true;
+  if (typeof m.cat === "number" && Number.isInteger(m.cat) && m.cat >= 0 && m.cat < CATEGORY_LABELS.length)
+    return true;
+  return false;
+}
+
+/** The §2.4 rows a tile can honestly offer: name · type from ext ·
+ *  category · size (hero) · share of parent. Each row exists only when its
+ *  field is real — missing metadata is absent from the card, never a dash,
+ *  never a guess. */
+function tileMetaPairs(m: PlateMeta, name: string, shareDenom: number): PreviewPair[] {
+  const pairs: PreviewPair[] = [];
+  const nm = typeof m.name === "string" && m.name.trim() !== "" ? m.name : name;
+  if (nm) pairs.push({ k: "name", v: nm });
+  // type from the extension (inherently-upper data — extensions print as
+  // spelled); a directory's type is `folder`, extension irrelevant.
+  const ext = typeof m.ext === "string" && m.ext.trim() !== "" ? m.ext.trim() : extOf(nm);
+  const type = m.isDir === true ? "folder" : ext;
+  if (type) pairs.push({ k: "type", v: type });
+  const cat = m.cat;
+  if (typeof cat === "number" && Number.isInteger(cat) && cat >= 0 && cat < CATEGORY_LABELS.length) {
+    pairs.push({ k: "category", v: CATEGORY_LABELS[cat] });
+  }
+  const size = typeof m.size === "number" && isFinite(m.size) && m.size >= 0 ? m.size : null;
+  if (size !== null) pairs.push({ k: "size", v: formatBytes(size) });
+  if (size !== null && isFinite(shareDenom) && shareDenom > 0) {
+    pairs.push({ k: "share", v: formatPercent(size / shareDenom) });
+  }
+  return pairs;
+}
+
+/** Paint the step-2 card: a §2.4 META readout built purely from tile
+ *  metadata, on the shared frame (head strip retained — the file stays
+ *  labelled). Rail suppressed: its datum candidates (time/format/signature)
+ *  belong to parsed payloads. */
+function paintTileMetaCard(
+  el: HTMLElement,
+  m: PlateMeta,
+  tile: PlateTile,
+  theme: "light" | "dark",
+  shareDenom: number,
+  fileName: string
+): void {
+  // §2.4 proportion cap: the CSS `[data-family="meta"]` max-* clamps the
+  // ELEMENT to 460×340; the row math, head tier and rail test must clamp
+  // with it (mirrored constants — see META_CAP_W/H) or rows would be cut
+  // by pixels without their footer. Anchor and gates stay untouched.
+  const tw = Math.min(Math.max(0, num(tile.w)), META_CAP_W);
+  const th = Math.min(Math.max(0, num(tile.h)), META_CAP_H);
+  el.className = "tm-prev";
+  el.dataset.theme = theme;
+  el.dataset.head = tw >= 320 ? "lg" : "sm"; // §2.0: 28px head at painted ≥320
+  el.dataset.family = "meta";
+  const shell = buildShell(el);
+  shell.name.textContent = fileName || (typeof m.name === "string" ? m.name : "");
+  shell.meta.textContent = renderMeta(
+    shell.body,
+    { pairs: tileMetaPairs(m, shell.name.textContent, shareDenom) },
+    bodyBox({ w: tw, h: th }),
+    tw,
+    th,
+    el,
+    theme,
+    false
+  );
+}
+
+/** The painted tile box the draw loop writes on the element (CSS custom
+ *  props, px) before any fill — read back when this module is entered
+ *  without a tile argument, so the ladder still sizes a card from real
+ *  pixels instead of guessing. */
+function readTileBox(el: HTMLElement): { w: number; h: number } {
+  const w = parseFloat(el.style.getPropertyValue("--tile-w"));
+  const h = parseFloat(el.style.getPropertyValue("--tile-h"));
+  return { w: isFinite(w) && w > 0 ? w : 0, h: isFinite(h) && h > 0 ? h : 0 };
 }
 
 // --------------------------------------------------------------- exports ---
@@ -735,69 +1133,66 @@ export function createPlate(): HTMLElement {
   return root;
 }
 
+/** PRIMARY entry — rewrite one pooled plate for one payload (idempotent).
+ *
+ *  Fallback ladder (a plate is never an empty state):
+ *   1. usable payload family, at/above its §2.0 gate → that family's
+ *      renderer (a family UNDER its gate is not rendered — it steps down);
+ *   2. payload null/absent/degenerate → a META card built from the tile's
+ *      own metadata (`opts.meta`, or the optional `meta` argument):
+ *      name, type from ext, category, hero size, share of parent;
+ *   3. metadata also missing → the honest dots state: `no preview` plus
+ *      the real reason in `.num` (fillFallbackPlate).
+ *
+ *  Backwards compatible: `p` widens to null/undefined, `fileName` stays
+ *  assignable, `theme`/`tile` are untouched, and `meta` is optional both
+ *  as `opts.meta` and as the trailing argument. */
 export function fillPlate(
   el: HTMLElement,
-  p: PreviewPayload,
-  opts: { fileName: string; theme: "light" | "dark"; tile: { w: number; h: number } }
+  p: PreviewPayload | null | undefined,
+  opts: FillPlateOptions,
+  meta?: PlateMeta
 ): void {
   const t = opts.tile || { w: 0, h: 0 };
   const tile = { w: Math.max(0, num(t.w)), h: Math.max(0, num(t.h)) };
   const payload: PreviewPayload = p || {};
+  const m: PlateMeta | null = opts.meta ?? meta ?? null;
+  const theme: "light" | "dark" = opts.theme === "dark" ? "dark" : "light";
 
   // pooled node: reset modifiers + full content rebuild every call (cheap,
   // and payload identity carries no entryId — a skip-guard could serve stale
   // bytes when the pool recycles a same-named file)
   el.className = "tm-prev";
-  el.dataset.theme = opts.theme === "dark" ? "dark" : "light";
+  el.dataset.theme = theme;
   el.dataset.head = tile.w >= 320 ? "lg" : "sm"; // §2.0: 28px head at ≥320
   const shell = buildShell(el);
   const box = bodyBox(tile);
   const fam = typeof payload.family === "string" ? payload.family.toUpperCase() : "";
+  const fileName =
+    opts.fileName || (m && typeof m.name === "string" ? m.name : "") || "";
+  shell.name.textContent = fileName;
 
-  const plan =
-    (fam === "TEXT" || fam === "SVG") && payload.text
-      ? "text" // §integrator-note-2: SVG previews as TEXT this wave
-      : fam === "HEX" && payload.hex
-        ? "hex"
-        : fam === "IMAGE" && payload.image
-          ? "image"
-          : fam === "LIST" && payload.list
-            ? "list"
-            : fam === "DB" && (payload.db || payload.list)
-              ? payload.db
-                ? "db"
-                : "list"
-              : fam === "META" && payload.meta
-                ? "meta"
-                : fam === "MEDIA" && payload.media
-                  ? "media"
-                  : // content-driven rescue when the family tag is missing/unknown
-                  payload.text
-                  ? "text"
-                  : payload.hex
-                    ? "hex"
-                    : payload.image
-                      ? "image"
-                      : payload.db
-                        ? "db"
-                        : payload.list
-                          ? "list"
-                          : payload.meta
-                            ? "meta"
-                            : payload.media
-                              ? "media"
-                              : "";
-
-  shell.name.textContent = opts.fileName || "";
-  if (!plan) {
-    fillFallbackPlate(el, "no preview data");
-    return;
+  // ---- step 1: a usable family, above its gate → the family renderer
+  let plan = resolvePlan(payload, fam);
+  let gateNote = "";
+  if (plan) {
+    const g = FAMILY_GATE[plan];
+    if (g && (tile.w < g[0] || tile.h < g[1])) {
+      plan = ""; // §2.0: below a family's gate, don't render it
+      gateNote = `needs ${g[0]} × ${g[1]}`; // step 3's honest reason
+    }
   }
 
-  let metaText = "";
+  // real byte size for the families whose head meta carries it
+  const sizeStr =
+    m && typeof m.size === "number" && isFinite(m.size) && m.size >= 0
+      ? formatBytes(m.size)
+      : "";
+
+  let metaText: string | null = "";
   switch (plan) {
     case "text":
-      metaText = renderText(shell.body, payload.text as PreviewText, box);
+      metaText = renderText(shell.body, payload.text as PreviewText, box, sizeStr);
       break;
     case "hex":
       metaText = renderHex(shell.body, payload.hex as PreviewHex, box, tile.w, el);
@@ -808,11 +1203,12 @@ export function fillPlate(
         payload.image as PreviewImage,
         box,
         tile.w,
-        opts.fileName || "",
-        el
+        fileName,
+        el,
+        sizeStr
       );
       break;
-    case "list":
+    case "list": {
       metaText = renderTable(
         shell.body,
         listCols(payload.list as PreviewList),
@@ -820,44 +1216,136 @@ export function fillPlate(
         fam === "DB" ? "tables" : "entries",
         (payload.list as PreviewList).truncated === true
       );
+      // §2.3: the listing source names the section — "zip · 47 entries",
+      // "folder · 12 entries". The payload spells the word (lower-case
+      // data); absent kind → the plain count, as before. A folder card that
+      // descended a single-child wrapper names the chain: "folder via User
+      // Data · 20 entries" — real ancestry, not a guessed path.
+      const list = payload.list as PreviewList;
+      const lk = typeof list.kind === "string" ? list.kind.trim() : "";
+      const via = Array.isArray(list.via)
+        ? list.via
+            .filter((v) => typeof v === "string" && v.trim() !== "")
+            .join(" / ")
+        : "";
+      // The head count is the payload's REAL total when it knows one, not
+      // the number of rows this card happened to receive: a folder card is
+      // built from a bounded child query, and "32 entries" for a 100-child
+      // folder would understate the truth. The table's footer still carries
+      // the withheld rows with the honest "+" lower-bound mark.
+      const entries = Array.isArray(list.entries) ? list.entries : [];
+      const total =
+        typeof list.total === "number" && Number.isFinite(list.total) && list.total > entries.length
+          ? list.total
+          : entries.length;
+      const countText = `${formatCount(total)} ${noun1("entries", total)}`;
+      if (lk) metaText = `${lk}${via ? ` via ${via}` : ""} · ${countText}`;
       break;
+    }
     case "db":
-      metaText = renderTable(
+      metaText = renderDb(shell.body, payload.db as PreviewDb, box);
+      break;
+    case "meta": {
+      // §2.4 proportion cap: CSS clamps the ELEMENT (`data-family="meta"`);
+      // the row math, head tier and rail test clamp with it (mirrored
+      // constants — see META_CAP_W/H). The gate above stays on the FULL
+      // painted box — the cap only trims a plate that already qualified.
+      const cw = Math.min(tile.w, META_CAP_W);
+      const ch = Math.min(tile.h, META_CAP_H);
+      el.dataset.head = cw >= 320 ? "lg" : "sm"; // tier follows the painted width
+      metaText = renderMeta(
         shell.body,
-        dbCols(payload.db as PreviewDb),
+        payload.meta as PreviewMeta,
+        bodyBox({ w: cw, h: ch }),
+        cw,
+        ch,
+        el,
+        theme
+      );
+      // head meta = SHARE only (the hero stat owns the size). A payload
+      // `share` pair wins (renderMeta returned it); else compute from the
+      // caller's real tile metadata + denominator; else omit — a share is
+      // printed only when its denominator is real, never fabricated.
+      if (!metaText) {
+        const denom = m?.parentSize ?? opts.parentSize ?? 0;
+        const bytes =
+          m && typeof m.size === "number" && isFinite(m.size) && m.size >= 0 ? m.size : 0;
+        if (bytes > 0 && isFinite(denom) && denom > 0) {
+          metaText = formatPercent(bytes / denom);
+        }
+      }
+      break;
+    }
+    case "media":
+      metaText = renderMedia(
+        shell.body,
+        payload.media as PreviewMedia,
         box,
-        "tables",
-        (payload.db as PreviewDb).truncated === true
+        fileName,
+        el,
+        theme
       );
       break;
-    case "meta":
-      metaText = renderMeta(shell.body, payload.meta as PreviewMeta, box, tile.w, tile.h, el);
-      break;
-    case "media":
-      metaText = renderMedia(shell.body, payload.media as PreviewMedia, box, opts.fileName || "", el);
-      break;
   }
-  shell.meta.textContent = metaText;
-  el.dataset.family = plan;
+
+  if (plan && metaText !== null) {
+    shell.meta.textContent = metaText;
+    el.dataset.family = plan;
+    return;
+  }
+
+  // ---- step 2: no renderable payload → the META card from tile metadata
+  if (m && hasTileMeta(m)) {
+    if (tile.w >= 120 && tile.h >= 92) {
+      paintTileMetaCard(
+        el,
+        m,
+        tile,
+        theme,
+        m.parentSize ?? opts.parentSize ?? 0,
+        fileName
+      );
+      return;
+    }
+    gateNote = "needs 120 × 92"; // blocked at the META gate — the real reason
+  }
+
+  // ---- step 3: metadata missing too → the honest dots state + real reason
+  fillFallbackPlate(el, gateNote || "no preview data");
 }
 
 /** MEDIA — inert instrument plate. The binding law gives plates no pointer
  *  events (map gestures win, integrator note 1), so the native transport
  *  controls are out: video previews its real first frame (framed like
- *  IMAGE), audio gets a centred stat; the one datum either way is the
- *  file's real duration (formatElapsed — DTO value, refined by the
- *  element's own metadata). */
+ *  IMAGE), audio gets a centred stat. Real container facts ride the head
+ *  meta (extension, parsed duration as a formatDuration clock stamp, pixel
+ *  dimensions) and the parsed `pairs` render below the media area in the
+ *  meta kv rhythm — every field real or omitted, never invented. */
 function renderMedia(
   body: HTMLElement,
   m: PreviewMedia,
-  _box: { w: number; h: number },
+  box: Box,
   fileName: string,
-  root: HTMLElement
+  root: HTMLElement,
+  theme: "light" | "dark"
 ): string {
   body.className = "tm-prev__body tm-media";
+  // head meta — the same string on every path, so the file stays labelled
+  // even when the bed degrades: extension · parsed duration · pixel dims.
+  const head = (): string => {
+    const parts: string[] = [];
+    const ex = extOf(fileName, m.mime);
+    if (ex) parts.push(ex);
+    const ms = num(m.durationMs);
+    if (ms > 0) parts.push(formatDuration(ms)); // clock stamp, not prose
+    const mw = num(m.w);
+    const mh = num(m.h);
+    if (mw > 0 && mh > 0) parts.push(`${mw} × ${mh}`);
+    return parts.join(" · ");
+  };
   if (!isTauri()) {
     renderFailed(body, "needs the desktop app"); // demo/web build: no asset scope
-    return extOf(fileName, m.mime);
+    return head();
   }
   const media: HTMLMediaElement =
     m.kind === "video" ? document.createElement("video") : document.createElement("audio");
@@ -865,21 +1353,23 @@ function renderMedia(
     media.src = convertFileSrc(m.path);
   } catch {
     renderFailed(body, "path unavailable");
-    return extOf(fileName, m.mime);
+    return head();
   }
   media.preload = "metadata";
   media.controls = false; // inert plate: no transport, no pointer events
 
+  // --- media area: first frame (video) / centred stat (audio) + stamp
+  const view = h("div", "tm-media__view");
   let stamp: HTMLElement | null = null;
   const fig = h("span", "stat-v");
   fig.hidden = true; // appears only with a real duration — never a dash
   const setMs = (ms: number): void => {
     if (!(ms > 0) || !root.contains(media)) return;
-    const t = formatElapsed(ms);
+    const t = formatDuration(ms);
     if (m.kind === "video") {
       if (!stamp) {
         stamp = h("span", "num tm-media__stamp");
-        body.append(stamp);
+        view.append(stamp);
       }
       stamp.textContent = t;
     } else {
@@ -890,17 +1380,37 @@ function renderMedia(
 
   if (m.kind === "video") {
     media.className = "tm-media__el";
-    body.append(media);
+    view.append(media);
   } else {
     // audio: no pixels to preview — a centred `.stat` readout
     const stack = h("div", "tm-stack");
     const stat = h("div", "stat");
     stat.append(h("span", "micro", "audio"), fig);
     stack.append(stat);
-    body.append(stack);
+    view.append(stack);
     media.className = "tm-media__src"; // metadata loader only — no visuals
-    body.append(media);
   }
+  body.append(view);
+  if (m.kind === "audio") body.append(media); // hidden loader, outside the view
+
+  // --- container facts: the parsed pairs in the meta kv rhythm, in the
+  // plate's lower band. Budget: the media area keeps the majority (≤40%
+  // of the body for pairs); an over-cap tail is cut with the honest
+  // footer. Fully-empty pairs never render a row.
+  const pairs = Array.isArray(m.pairs) ? m.pairs.filter((pr) => str(pr.k) || str(pr.v)) : [];
+  if (pairs.length > 0) {
+    const cap = Math.floor(box.h * 0.4);
+    const shown0 = Math.floor((cap - 12) / 18); // bed padding 6×2
+    const cut = pairs.length > shown0;
+    const shown = Math.max(0, cut ? Math.floor((cap - 12 - 16) / 18) : shown0);
+    if (shown > 0) {
+      const bed = h("div", "tm-media__pairs");
+      for (let i = 0; i < shown; i++) bed.append(kvRow(pairs[i], theme));
+      body.append(bed);
+      if (cut) body.append(footer("tm-meta__more", "fields", pairs.length - shown, false));
+    }
+  }
+
   // Pooled plates get refilled with other payloads; a late event from a
   // detached element must never stomp the plate's current content.
   media.addEventListener("loadedmetadata", () => {
@@ -913,12 +1423,28 @@ function renderMedia(
     renderFailed(body, "decode error");
   });
   setMs(num(m.durationMs)); // DTO duration lands before metadata arrives
-  return extOf(fileName, m.mime); // header meta: the real extension, or none
+  return head(); // real fields only, each absent field omitted
 }
 
-/** Honest unavailable state (§2.0 leaf interior): dots bed over the whole
- *  plate, keyed hatch swatch + `preview unavailable` + the real reason. */
-export function fillFallbackPlate(el: HTMLElement, reason: string): void {
+/** Honest unavailable state (§2.0 step 3): dots bed over the whole plate,
+ *  keyed hatch swatch + sentence-case `no preview` + the real reason in
+ *  `.num`. With tile metadata in the optional third argument it paints the
+ *  step-2 metadata card instead — so a caller holding metadata never lands
+ *  on the dots state when a card can still be built. Reason printed only
+ *  when it adds information (the renderer passes `no preview` as its
+ *  reason; echoing the word above it would be noise, not honesty). */
+export function fillFallbackPlate(el: HTMLElement, reason: string, meta?: PlateMeta): void {
+  if (meta && hasTileMeta(meta)) {
+    const tile = readTileBox(el);
+    if (tile.w >= 120 && tile.h >= 92) {
+      const theme: "light" | "dark" =
+        (el.dataset.theme ?? document.documentElement.dataset.theme) === "light"
+          ? "light"
+          : "dark";
+      paintTileMetaCard(el, meta, tile, theme, meta.parentSize ?? 0, meta.name || "");
+      return;
+    }
+  }
   el.className = "tm-prev tm-prev--fallback"; // modifier drops the head strip
   el.dataset.head = "sm";
   el.removeAttribute("data-family");
@@ -927,8 +1453,9 @@ export function fillFallbackPlate(el: HTMLElement, reason: string): void {
   const stack = h("div", "tm-stack");
   stack.append(
     h("span", "tex-hatch tm-fallback__swatch"),
-    h("span", "micro", "preview unavailable")
+    h("span", "micro", "no preview")
   );
-  if (reason) stack.append(h("span", "num tm-stack__note", reason));
+  const note = reason && reason !== "no preview" ? reason : "";
+  if (note) stack.append(h("span", "num tm-stack__note", note));
   shell.body.append(stack);
 }

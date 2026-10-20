@@ -91,13 +91,17 @@
   min-width: 0;
 }
 .crumb-sep {
-  color: var(--ink-3);
+  /* ink-2, not ink-3: the chevron is the only visual separator in the path
+     chain, so it carries 1.4.11 non-text contrast — ink-3 falls to ~2.6:1
+     in the light theme. Shape, not weight, keeps it quieter than the text. */
+  color: var(--ink-2);
   display: flex;
   align-items: center;
   flex: none;
 }
 .crumb-ellipsis {
-  color: var(--ink-3);
+  /* the collapse marker is text — 4.5:1 at every size */
+  color: var(--ink-2);
   padding: 0 2px;
 }
 
@@ -126,6 +130,12 @@
   background: transparent;
   font-size: 12.5px;
   color: var(--ink);
+}
+.searchbox input::placeholder {
+  /* the placeholder is instructional copy: ink-2 holds 4.5:1 in both
+     themes, and opacity 1 keeps any UA default from diluting it */
+  color: var(--ink-2);
+  opacity: 1;
 }
 
 /* --------------------------------------------------- content row
@@ -260,7 +270,8 @@
 .map-state-reason {
   margin: 0;
   font-size: 10.5px;
-  color: var(--ink-3);
+  /* the engine's own failure text: ink-2 keeps 4.5:1 (ink-3 does not) */
+  color: var(--ink-2);
   max-height: 3em;
   overflow: hidden;
   white-space: normal;
@@ -359,7 +370,9 @@
   font-weight: 500;
   font-size: 11px;
   letter-spacing: 0.005em;
-  color: var(--ink-3);
+  /* the key half of every readout — 11px label voice needs 4.5:1, which
+     ink-3 misses in both themes; ink-2 is the .micro label colour */
+  color: var(--ink-2);
 }
 .statusbar .num {
   color: var(--ink);
@@ -369,11 +382,13 @@
    "filtered" reads by texture first (Two-Channel Rule), the word confirms.
    As a <button> it is also the switch — click unhides every category —
    so it carries the status-btn's pointer affordance and hover step. */
-.sb-hid .chip-dot {
+button.sb-hid .chip-dot {
+  /* hatch = "filtered" as a texture channel; ink-2 keeps the stripes at
+     3:1 in both themes — the word beside them carries the count. */
   background-image: repeating-linear-gradient(
     45deg,
     transparent 0 2px,
-    var(--ink-3) 2px 3px
+    var(--ink-2) 2px 3px
   );
 }
 button.sb-hid {

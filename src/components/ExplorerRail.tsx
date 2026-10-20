@@ -1,47 +1,40 @@
 // Inspector rail — the instrument panel's right column, three hairline-
-// stacked cells: selection readout, the volume's composition (one row per
-// category; a row click filters the map), and the scan's largest files
-// under a local name filter.
+// stacked cells: selection/current-folder readout, the composition
+// (one row per category; a row click filters the map), and the scan's
+// largest files under a local name filter — a rank list, index over name
+// over mono size.
 //
 // Layout law: exactly ONE scroll region — the file list (flex:1, min 0).
 // The readout and composition are fixed sections; the rail itself never
 // scrolls, so the hero figure and the toggles stay in view on any window.
 //
 // Type register (anti-slop): labels are sentence-case Geist — section
-// titles 12/600 ink-2, the mode line a quiet 12px 500 ink-2. Mono tabular
-// (.num) is reserved for FIGURES (sizes, counts, percentages, the hero
-// value) and PATHS. Never uppercase-mono on a label.
+// titles 11.5/500 ink-2, the mode line the same step, the item name
+// 14/500, rows 12.5/16. Mono tabular (.num) is reserved for FIGURES
+// (sizes, counts, percentages, the hero value, the rank index) and
+// PATHS. Never uppercase-mono on a label.
+//
+// States, all quiet: no data is an EmptyState (what's missing + why),
+// loading is static --fill-quiet skeleton rows (no shimmer — a skeleton
+// that sits still is honest about not knowing), and a failure is a
+// StatusWord plus the engine's own message — never a raw error overlay.
+// Missing figures print the product's dash; nothing is fabricated.
 //
 // Hover truth: each file row opens the shared HoverCard (ui.tsx) with THAT
 // row's payload — anchored at enter coordinates, interactive, kept alive by
-// a 150ms leave-grace so the card's real actions stay clickable. The wrong-
-// row native `title` tooltips are gone; no native tooltip exists here.
+// a 150ms leave-grace so the card's real actions stay clickable. Rows carry
+// no native tooltips; the readout's icon-only actions carry title +
+// aria-label (DESIGN's icon-button rule) via the shared IconButton.
 
-import {
-  Copy,
-  Database,
-  File,
-  FileArchive,
-  FileCode,
-  FileImage,
-  FileMusic,
-  FileSpreadsheet,
-  FileText,
-  Film,
-  FolderOpen,
-  Package,
-  Search,
-  SquareArrowOutUpRight,
-  type LucideIcon,
-} from "lucide-react";
+import { Copy, FolderOpen, Search, SquareArrowOutUpRight } from "lucide-react";
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type FocusEvent,
   type PointerEvent,
-  type ReactNode,
 } from "react";
 import { CATEGORY_LABELS, categoryStyle } from "../lib/colors";
 import {
@@ -49,11 +42,19 @@ import {
   formatBytes,
   formatCount,
   formatPercent,
+  plural,
   splitBytes,
 } from "../lib/format";
 import { demoState, openWithSystem, revealInExplorer } from "../lib/ipc";
 import type { LargestFile } from "../lib/types";
-import { HoverCard, type HoverCardData } from "./ui";
+import {
+  EmptyState,
+  HoverCard,
+  IconButton,
+  StatusWord,
+  VisuallyHidden,
+  type HoverCardData,
+} from "./ui";
 
 export interface RailDetail {
   id: number;
@@ -80,30 +81,17 @@ const LEAVE_GRACE_MS = 150;
  *  frozen at the pointer's enter coordinates relative to the rail. */
 type RowHover = { f: LargestFile; x: number; y: number };
 
-/** Extension → glyph table: shape reads faster than reading the name, and a
- *  generic "file" icon is only the fallback, never the only voice. Only lucide
- *  names confirmed present in the installed build. */
-const EXT_ICONS: [exts: string, icon: LucideIcon][] = [
-  ["png jpg jpeg gif webp bmp svg ico heic tif tiff avif", FileImage],
-  ["mp4 mkv avi mov webm wmv flv m4v mpg mpeg", Film],
-  ["mp3 wav flac aac ogg m4a wma opus mid midi", FileMusic],
-  ["zip rar 7z tar gz bz2 xz iso cab", FileArchive],
-  [
-    "js mjs cjs ts jsx tsx py java c cpp h hpp cs go rs rb php swift kt html htm css scss vue sql json xml",
-    FileCode,
-  ],
-  ["pdf doc docx txt md rtf odt log", FileText],
-  ["xls xlsx csv tsv ods", FileSpreadsheet],
-  ["sqlite sqlite3 db db3 accdb", Database],
-  ["exe msi msix appx dll so dylib", Package],
-];
+/** Rank-list name budget: the name column measures ~165px (300 rail −
+ *  section padding − rank/size columns − the stable scrollbar gutter), and
+ *  Geist 12.5 runs ≈6.5px/char, so 25 characters sit inside it. Longer names
+ *  are cut from the LEFT — the tail (extension included) is the identity,
+ *  the same contract ellipsizePath() applies to paths — and CSS ellipsis
+ *  stays as the backstop for unusually wide glyphs. */
+const NAME_TAIL_MAX = 25;
 
-function fileIcon(name: string): LucideIcon {
-  const i = name.lastIndexOf(".");
-  const ext = i > 0 ? name.slice(i + 1).toLowerCase() : "";
-  for (const [exts, icon] of EXT_ICONS)
-    if (` ${exts} `.includes(` ${ext} `)) return icon;
-  return File;
+function tailName(name: string, max = NAME_TAIL_MAX): string {
+  if (name.length <= max) return name;
+  return `…${name.slice(Math.max(0, name.length - (max - 1)))}`;
 }
 
 function catLabel(cat: number): string {
@@ -111,29 +99,12 @@ function catLabel(cat: number): string {
 }
 
 /** Hero pair: the value in display-size mono, the unit in the small `.u`.
- *  A zero/unknown figure reads as an honest "0 B" — never a dash pretending
- *  to be data this instrument did not measure. */
+ *  A measured zero reads as an honest "0 B"; an unknown (not-yet-loaded or
+ *  non-finite) figure prints the product's dash — never a fabricated 0. */
 function heroOf(n: number): { num: string; unit: string } {
-  if (!Number.isFinite(n) || n <= 0) return { num: "0", unit: "B" };
+  if (!Number.isFinite(n) || n < 0) return { num: "—", unit: "" };
+  if (n === 0) return { num: "0", unit: "B" };
   return splitBytes(n);
-}
-
-/** Selection-readout icon button: aria-labelled, no native tooltip — the
- *  button's icon + word-level access (keyboard focus ring) carries it. */
-function RailIconAction({
-  label,
-  onClick,
-  children,
-}: {
-  label: string;
-  onClick: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <button type="button" className="icon-btn" aria-label={label} onClick={onClick}>
-      {children}
-    </button>
-  );
 }
 
 export function ExplorerRail({
@@ -151,6 +122,8 @@ export function ExplorerRail({
   selectedId,
   currentId,
   theme,
+  loading = false,
+  error = null,
 }: {
   selection: RailSelection | null;
   current: { name: string; size: number; items: number; path: string };
@@ -166,6 +139,13 @@ export function ExplorerRail({
   selectedId: number | null;
   currentId: number;
   theme: "light" | "dark";
+  /** True while the explorer's folder read is in flight: the rail prints
+   *  dashes instead of stale figures and swaps both data sections for
+   *  skeleton rows. Optional — absent, the rail renders as data-ready. */
+  loading?: boolean;
+  /** A real failure message (engine text, verbatim). Rendered as a quiet
+   *  StatusWord + message in the readout cell — never an overlay. */
+  error?: string | null;
 }) {
   // Filter is the rail's only persisted local state. `largest` is a frozen
   // prop (≤30 rows fetched once per scan), so filtering is a per-keystroke
@@ -241,10 +221,20 @@ export function ExplorerRail({
     ? largest.filter((f) => f.name.toLowerCase().includes(needle))
     : largest;
 
-  // The hovered id must still be a visible row (filter changes, list swaps).
-  // Dropped = closed; nothing stale is ever displayed.
+  // True rank in the volume-wide list (1-based, zero-padded for the mono
+  // column). Anchored to `largest`, not `shown`, so a filtered view keeps
+  // each row's honest rank instead of renumbering it into a lie.
+  const rankOf = useMemo(() => {
+    const m = new Map<number, number>();
+    largest.forEach((f, i) => m.set(f.id, i + 1));
+    return m;
+  }, [largest]);
+
+  // The hovered id must still be a visible row (filter changes, list swaps,
+  // a loading pass that replaced the list with skeletons). Dropped = closed;
+  // nothing stale is ever displayed.
   const hoverLive =
-    hover && shown.some((s) => s.id === hover.f.id) ? hover : null;
+    !loading && hover && shown.some((s) => s.id === hover.f.id) ? hover : null;
 
   const buildCard = (f: LargestFile): HoverCardData => ({
     name: f.name,
@@ -330,32 +320,51 @@ export function ExplorerRail({
     );
   };
 
+  // Hero figure for the readout cell. With no selection the figure is the
+  // current folder's own size; while a folder read is in flight that number
+  // is unknown (stale or not yet reported), so it prints the dash.
+  const hero = detail
+    ? heroOf(multi && selection ? selection.total : detail.size)
+    : heroOf(loading ? Number.NaN : current.size);
+
   return (
     <aside className="rail" ref={railRef}>
       {/* ------------------------------------------------ selection readout
           A quiet sentence-case line names the readout mode (Selection /
           N items selected / Current folder); the hero is the display step
-          (`stat is-hero`, 34px) because this number is the rail's reason to
-          exist, and it carries the multi-total in selection mode. Sub-line
-          words are Geist, its figures mono tabular, the category is a chip
-          (color dot + word — the Two-Channel Rule) and the path a single
-          mono line. Nothing here is measured nowhere. */}
+          (`stat is-hero`, 34px tabular mono) because this number is the
+          rail's reason to exist, and it carries the multi-total in
+          selection mode. Sub-line words are Geist (plural() keeps "1 file"
+          honest), its figures mono tabular, the category is a chip (color
+          dot + word — the Two-Channel Rule) and the path a single mono
+          line, ellipsized tail-true. A failure sits here as a quiet word
+          plus the engine's message. Nothing is measured nowhere. */}
       <section className="rail-sec">
+        {error && (
+          <div className="rail-error">
+            <StatusWord tone="critical">error</StatusWord>
+            <p className="rail-error-msg">{error}</p>
+          </div>
+        )}
         {detail ? (
           <div className="stat is-hero">
             <p className="sel-label">
               {multi
-                ? `${formatCount(selection!.ids.length)} items selected`
+                ? `${formatCount(selection!.ids.length)} ${plural(
+                    selection!.ids.length,
+                    "item",
+                  )} selected`
                 : "Selection"}
             </p>
             <p className="sel-name">{detail.name}</p>
             <p className="stat-v">
-              {heroOf(multi ? selection!.total : detail.size).num}
-              <span className="u">{heroOf(multi ? selection!.total : detail.size).unit}</span>
+              {hero.num}
+              {hero.unit && <span className="u">{hero.unit}</span>}
             </p>
             {multi ? (
               <p className="sel-sub">
-                <span className="num">{formatCount(selection!.ids.length)}</span> items
+                <span className="num">{formatCount(selection!.ids.length)}</span>{" "}
+                {plural(selection!.ids.length, "item")}
                 {totalScan > 0 && (
                   <>
                     {" · "}
@@ -374,9 +383,11 @@ export function ExplorerRail({
                     {detail.isDir && (
                       <>
                         {totalScan > 0 && " · "}
-                        <span className="num">{formatCount(detail.fileCount)}</span> files
+                        <span className="num">{formatCount(detail.fileCount)}</span>{" "}
+                        {plural(detail.fileCount, "file")}
                         {" · "}
-                        <span className="num">{formatCount(detail.kidCount)}</span> items
+                        <span className="num">{formatCount(detail.kidCount)}</span>{" "}
+                        {plural(detail.kidCount, "item")}
                       </>
                     )}
                   </p>
@@ -393,19 +404,19 @@ export function ExplorerRail({
                 </div>
                 <p className="sel-path num">{ellipsizePath(detail.path, 44)}</p>
                 <div className="sel-actions">
-                  <RailIconAction
+                  <IconButton
                     label="Reveal in Explorer"
                     onClick={() => onReveal(detail.id)}
                   >
                     <FolderOpen size={14} />
-                  </RailIconAction>
-                  <RailIconAction label="Copy path" onClick={() => onCopyPath(detail.id)}>
+                  </IconButton>
+                  <IconButton label="Copy path" onClick={() => onCopyPath(detail.id)}>
                     <Copy size={14} />
-                  </RailIconAction>
+                  </IconButton>
                   {realShell && !detail.isDir && (
-                    <RailIconAction label="Open file" onClick={() => onOpen(detail.id)}>
+                    <IconButton label="Open file" onClick={() => onOpen(detail.id)}>
                       <SquareArrowOutUpRight size={14} />
-                    </RailIconAction>
+                    </IconButton>
                   )}
                 </div>
               </>
@@ -416,18 +427,23 @@ export function ExplorerRail({
             <p className="sel-label">Current folder</p>
             <p className="sel-name">{current.name}</p>
             <p className="stat-v">
-              {heroOf(current.size).num}
-              <span className="u">{heroOf(current.size).unit}</span>
+              {hero.num}
+              {hero.unit && <span className="u">{hero.unit}</span>}
             </p>
-            <p className="sel-sub">
-              <span className="num">{formatCount(current.items)}</span> items
-              {totalScan > 0 && (
-                <>
-                  {" · "}
-                  <span className="num">{formatPercent(current.size / total)}</span> of volume
-                </>
-              )}
-            </p>
+            {loading ? (
+              <p className="sel-sub">Reading folder…</p>
+            ) : (
+              <p className="sel-sub">
+                <span className="num">{formatCount(current.items)}</span>{" "}
+                {plural(current.items, "item")}
+                {totalScan > 0 && (
+                  <>
+                    {" · "}
+                    <span className="num">{formatPercent(current.size / total)}</span> of volume
+                  </>
+                )}
+              </p>
+            )}
             <p className="sel-path num">{ellipsizePath(current.path, 44)}</p>
           </div>
         )}
@@ -435,81 +451,102 @@ export function ExplorerRail({
 
       {/* ------------------------------------------------ composition
           One row per category: chip-style swatch, sentence-case label, and
-          the measured size + share as mono figures up right. A 4px share
-          bar sits on a dot-matrix bed under each row so proportions read
-          without holding every number in mind — real shares only. Row click
-          lifts to the treemap filter; a filtered category wears the tex-
-          hatch over its swatch and drops to ink-3 (the Two-Channel Rule:
-          texture + label, never hue alone). Shares divide by the sum of ALL
-          categories — the legend reports the volume, not the visible subset. */}
+          the measured size + share as mono figures up right; a 4px share
+          meter on a dot-matrix bed sits under each row so proportions read
+          without holding every number in mind — real shares only. Rows are
+          real toggle buttons (aria-pressed); a click lifts to the treemap
+          filter. A filtered category wears the tex-hatch over its swatch
+          and drops to ink-3 (the Two-Channel Rule: texture + label, never
+          hue alone). Shares divide by the sum of ALL categories — the
+          legend reports the volume, not the visible subset. While the
+          folder read is in flight the rows are quiet skeletons: no stale
+          totals, no shimmer. */}
       <section className="rail-sec">
         <h3 className="rail-title">
           Categories
-          {categories.length > 0 && (
+          {!loading && categories.length > 0 && (
             <span className="count num">{formatBytes(catTotal)}</span>
           )}
         </h3>
-        {categories.length === 0 && (
-          <p className="rail-empty">No scan data yet.</p>
+        {loading ? (
+          <>
+            <VisuallyHidden>Loading category totals…</VisuallyHidden>
+            <div className="rail-skel skel-cats" aria-hidden="true">
+              {Array.from({ length: 8 }, (_, i) => (
+                <div className="sk-row" key={i}>
+                  <span className="sk-line">
+                    <span className="sk sk-sw" />
+                    <span className="sk sk-nm" />
+                    <span className="sk sk-vl" />
+                  </span>
+                  <span className="sk sk-bar" />
+                </div>
+              ))}
+            </div>
+          </>
+        ) : categories.length === 0 ? (
+          <EmptyState title="No scan data yet." />
+        ) : (
+          categories.map((bytes, cat) => {
+            const off = hiddenCats.has(cat);
+            const cs = categoryStyle(cat, theme);
+            const share = (bytes / catSum) * 100;
+            return (
+              <button
+                key={cat}
+                type="button"
+                className={off ? "cat-row is-off" : "cat-row"}
+                onClick={() => onToggleCat(cat)}
+                aria-pressed={!off}
+              >
+                <span className="cat-main">
+                  <span
+                    aria-hidden="true"
+                    className={cs.hatch ? "cat-swatch is-hatch" : "cat-swatch"}
+                    style={{ background: cs.css }}
+                  />
+                  <span className="cat-lbl">{CATEGORY_LABELS[cat]}</span>
+                  <span className="cat-size num">{formatBytes(bytes)}</span>
+                  <span className="cat-pct num">{formatPercent(bytes / catSum)}</span>
+                </span>
+                <span aria-hidden="true" className="cat-bar tex-dots">
+                  <span
+                    className="cat-bar-fill"
+                    style={{
+                      width: `${share}%`,
+                      minWidth: bytes > 0 ? 2 : undefined,
+                      background: cs.css,
+                    }}
+                  />
+                </span>
+              </button>
+            );
+          })
         )}
-        {categories.map((bytes, cat) => {
-          const off = hiddenCats.has(cat);
-          const cs = categoryStyle(cat, theme);
-          const share = (bytes / catSum) * 100;
-          return (
-            <button
-              key={cat}
-              type="button"
-              className={off ? "cat-row is-off" : "cat-row"}
-              onClick={() => onToggleCat(cat)}
-              aria-pressed={!off}
-            >
-              <span className="cat-main">
-                <span
-                  aria-hidden="true"
-                  className={cs.hatch ? "cat-swatch is-hatch" : "cat-swatch"}
-                  style={{ background: cs.css }}
-                />
-                <span className="cat-lbl">{CATEGORY_LABELS[cat]}</span>
-                <span className="cat-size num">{formatBytes(bytes)}</span>
-                <span className="cat-pct num">{formatPercent(bytes / catSum)}</span>
-              </span>
-              <span aria-hidden="true" className="cat-bar tex-dots">
-                <span
-                  className="cat-bar-fill"
-                  style={{
-                    width: `${share}%`,
-                    minWidth: bytes > 0 ? 2 : undefined,
-                    background: cs.css,
-                  }}
-                />
-              </span>
-            </button>
-          );
-        })}
       </section>
 
       {/* ------------------------------------------------ largest files
           Volume-wide outliers the current level may not contain, so the
           list keeps its own filter (case-insensitive name match, local
-          state) with the "visible of total" count in the title. Rows are
-          28px: extension glyph, ellipsized name, mono size on one shared
-          right axis. Hover opens the interactive HoverCard for THAT row at
-          the enter coordinates — its category chip, full path and two real
-          actions (reveal / open; omitted in demo where they resolve false).
-          The list alone scrolls; a scroll under an open card closes it, so
-          the readout can never sit over a row it does not describe. */}
+          state) with the "visible of total" count in the title. Rank rows:
+          mono rank index (true rank, held across filtering), tail-true
+          name, mono size on one shared right axis; rows 12.5/16 at 28px.
+          Hover opens the interactive HoverCard for THAT row at the enter
+          coordinates — its category chip, full path and two real actions
+          (reveal / open; omitted in demo where they resolve false). The
+          list alone scrolls; a scroll under an open card closes it, so the
+          readout can never sit over a row it does not describe. */}
       <section className="rail-sec rail-files">
         <h3 className="rail-title">
           Largest files
-          {largest.length > 0 && (
+          {!loading && largest.length > 0 && (
             <span className="count">
               <span className="num">{formatCount(shown.length)}</span> of{" "}
               <span className="num">{formatCount(largest.length)}</span>
             </span>
           )}
         </h3>
-        {largest.length > 0 && (
+        {!loading && largest.length > 0 && (
           <div className="rail-search">
             <Search size={12.5} aria-hidden="true" />
             <input
@@ -537,34 +574,59 @@ export function ExplorerRail({
           </div>
         )}
         <div className="rail-list" onScroll={clearCard}>
-          {largest.length === 0 && (
-            <p className="rail-empty">Nothing scanned yet.</p>
+          {loading ? (
+            <>
+              <VisuallyHidden>Loading largest files…</VisuallyHidden>
+              <div className="rail-skel skel-files" aria-hidden="true">
+                {Array.from({ length: 7 }, (_, i) => (
+                  <div className="sk-row" key={i}>
+                    <span className="sk sk-rk" />
+                    <span className="sk sk-nm" />
+                    <span className="sk sk-vl" />
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : largest.length === 0 ? (
+            <EmptyState
+              title="Nothing scanned yet."
+              hint="Largest files appear after a scan completes."
+            />
+          ) : shown.length === 0 ? (
+            <EmptyState
+              title="No matches."
+              hint={
+                <>
+                  Nothing in the largest files matches “{query.trim()}”.
+                </>
+              }
+            />
+          ) : (
+            shown.map((f) => {
+              const rank = rankOf.get(f.id) ?? 0;
+              const active = f.id === selectedId || f.id === currentId;
+              return (
+                <button
+                  key={f.id}
+                  type="button"
+                  className={active ? "file-row is-sel" : "file-row"}
+                  onClick={() => onPickLargest(f.id)}
+                  onPointerEnter={(e) => enterRow(f, e)}
+                  onPointerLeave={scheduleClose}
+                  onFocus={(e) => focusRow(f, e)}
+                  onBlur={blurKeepOrClose}
+                >
+                  {/* Visual rank only: AT already reads list order, and a
+                      bare "01" would announce as noise. */}
+                  <span aria-hidden="true" className="file-rank num">
+                    {String(rank).padStart(2, "0")}
+                  </span>
+                  <span className="file-nm">{tailName(f.name)}</span>
+                  <span className="file-sz num">{formatBytes(f.size)}</span>
+                </button>
+              );
+            })
           )}
-          {largest.length > 0 && shown.length === 0 && (
-            <p className="rail-empty">No matches.</p>
-          )}
-          {shown.map((f) => {
-            const Ic = fileIcon(f.name);
-            const active = f.id === selectedId || f.id === currentId;
-            return (
-              <button
-                key={f.id}
-                type="button"
-                className={active ? "file-row is-sel" : "file-row"}
-                onClick={() => onPickLargest(f.id)}
-                onPointerEnter={(e) => enterRow(f, e)}
-                onPointerLeave={scheduleClose}
-                onFocus={(e) => focusRow(f, e)}
-                onBlur={blurKeepOrClose}
-              >
-                <span aria-hidden="true" className="file-ico">
-                  <Ic size={13} />
-                </span>
-                <span className="file-nm">{f.name}</span>
-                <span className="file-sz num">{formatBytes(f.size)}</span>
-              </button>
-            );
-          })}
         </div>
       </section>
 

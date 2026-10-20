@@ -135,18 +135,28 @@ pub fn dir_flags(dir_path: &Path) -> DirFlags {
     }
 }
 
+/// Case-insensitive ASCII prefix test of a UTF-16 path against a byte needle —
+/// the `under_windows` rule of [`dir_flags`], run directly on the UTF-16 form
+/// (no `String`, no lowercasing). Non-ASCII code units can never equal an
+/// ASCII needle byte, so they simply never match.
+#[inline]
+fn u16_starts_ci(path: &[u16], needle: &[u8]) -> bool {
+    path.len() >= needle.len()
+        && path
+            .iter()
+            .zip(needle)
+            .all(|(&c, n)| lower_u16(c) == *n as u16)
+}
+
 /// Zero-alloc [`dir_flags`] for a directory path already available as UTF-16
 /// (the Windows fast path carries the path in that form for
 /// `FindFirstFileExW` and never needs a `PathBuf`).
+///
+/// The walker computes this ONCE for the scan root; every deeper directory
+/// derives its flags from its parent through [`child_flags`] instead of paying
+/// this whole-path scan again.
 pub fn dir_flags_utf16(path: &[u16]) -> DirFlags {
-    let under_windows = is_windows() && {
-        let needle = b"c:\\windows";
-        path.len() >= needle.len()
-            && path
-                .iter()
-                .zip(needle)
-                .all(|(&c, n)| lower_u16(c) == *n as u16)
-    };
+    let under_windows = is_windows() && u16_starts_ci(path, b"c:\\windows");
     let in_cache = !under_windows
         && path
             .split(|&c| c == '\\' as u16 || c == '/' as u16)
@@ -154,6 +164,28 @@ pub fn dir_flags_utf16(path: &[u16]) -> DirFlags {
     DirFlags {
         under_windows,
         in_cache,
+    }
+}
+
+/// [`DirFlags`] of a CHILD directory, derived from its parent's flags, its own
+/// full path and its own name.
+///
+/// Answers exactly what `dir_flags_utf16(child_path)` would: `under_windows`
+/// is the same fixed 10-code-unit prefix compare against the child path (which
+/// the walker already built), and `in_cache` is the parent's answer plus one
+/// more component test — components can only accumulate as a path grows, so
+/// the parent's verdict is never lost. What it skips is the part that costs
+/// O(path) per directory: re-splitting the whole path into components and
+/// testing each of them against all 13 cache names.
+///
+/// Zero allocations; called once per discovered subdirectory.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[inline]
+pub fn child_flags(parent: DirFlags, child_path: &[u16], name: &[u16]) -> DirFlags {
+    DirFlags {
+        under_windows: is_windows() && u16_starts_ci(child_path, b"c:\\windows"),
+        in_cache: parent.in_cache
+            || CACHE_DIRS.iter().any(|d| u16_ci_eq(name, d.as_bytes())),
     }
 }
 

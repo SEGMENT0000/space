@@ -1,14 +1,18 @@
 /* ---------------------------------------------------------------
    Volumes — the picker screen (DrivesView.tsx) as a narrative
    instrument: a headline statement (claim) + Σ-sub on the ground,
-   then ONE floating ledger panel (.panel) — hairline-divided rows
-   of letter keycap, identity, tick-gridded usage ribbon with tier
-   words, a two-line derived readout, and the primary Scan action.
-   The legend at the panel edge decodes every word the ribbon can
-   print. tex-hatch stays absent (it means filtered/unavailable in
-   the map world); the ribbon's own tier hatch is scoped to the
-   critical fill. No delete affordance; the footer states the
-   read-only promise.
+   then ONE floating ledger panel (.panel) — rhythm-divided rows of
+   letter keycap, identity, tick-gridded usage ribbon with tier
+   words, a two-line derived readout, and the quiet Scan action that
+   reveals on row hover, on keyboard focus, and at rest on pointers
+   that cannot hover. Three list states ship: reading (idle dot
+   bed), no volumes (recovery copy), and a failed query (danger
+   band: chip + verbatim engine message + Try again — mirroring the
+   scan screen's failure contract). The legend at the panel edge
+   decodes every mark the ribbon can print. tex-hatch stays absent
+   (it means filtered/unavailable in the map world); the ribbon's
+   own tier hatch is scoped to the critical fill. No delete
+   affordance; the footer states the read-only promise.
    --------------------------------------------------------------- */
 
 /* ---- the screen: one centered column of ground + panel ---- */
@@ -98,32 +102,34 @@
   color: var(--ink-2);
 }
 
-/* ---- the ledger: one panel, hairline-divided rows ---- */
+/* ---- the ledger: one panel, rows divided by rhythm (never rules) ---- */
 
 .drive-panel {
   flex: none;
   padding: 4px 0 0;
 }
-.drive-panel > .drive-row:first-child {
-  border-top: none;
-}
 
 /* Column widths are fixed (or content-fixed) so every row's cells align
    down the ledger: the figures block is a fixed 168px and the Scan
-   buttons are identical, so the two `auto` columns agree row to row. */
+   buttons are identical, so the two `auto` columns agree row to row.
+   The two `minmax` floors are sized so the full row still fits a
+   721px window (the fold below takes over at ≤720): 40 padding + 30
+   chip + 130 name + 150 ribbon + 168 figs + ~58 Scan + 64 gaps = 640,
+   under the 657px a 721px window leaves — nothing clips, nothing
+   overflows.
+   NO per-row rules: rows breathe on the 8pt rhythm and the hover fill
+   delimits interaction — the reference ledgers divide by space, and a
+   hairline between every row is the generic-table reflex. The ONE rule
+   in the panel separates the ledger from its keyed legend. */
 .drive-row {
   display: grid;
-  grid-template-columns: 30px minmax(160px, 1.05fr) minmax(230px, 1.2fr) 168px auto;
-  column-gap: 18px;
+  grid-template-columns: 30px minmax(130px, 1.05fr) minmax(150px, 1.2fr) 168px auto;
+  column-gap: 16px;
   align-items: center;
-  padding: 15px 20px;
-  border-bottom: 1px solid var(--hairline);
+  padding: 16px 20px;
   background: transparent;
   cursor: default;
   transition: background 120ms var(--ease-out);
-}
-.drive-row:last-child {
-  border-bottom: none;
 }
 /* one fill step on hover, one more on press — the whole row */
 .drive-row:hover {
@@ -242,6 +248,16 @@
     color-mix(in srgb, var(--danger) 45%, transparent) 4px 6px
   );
 }
+/* a volume the system reported without a capacity: dashed = no reading
+   (the reference's dashed vocabulary), cell grid suppressed — an empty
+   fill here would read as a measured 0%, which is not a number we have */
+.drive-meter.is-unknown .usage {
+  background: transparent;
+  border: 0.5px dashed var(--hairline-strong);
+}
+.drive-meter.is-unknown .usage::after {
+  display: none;
+}
 .drive-pct {
   flex: none;
   min-width: 4ch; /* uniform bed lengths: every row's pct right-aligns */
@@ -251,12 +267,11 @@
   line-height: 1;
   color: var(--ink-2);
 }
-.drive-meter.is-warn .drive-pct {
-  color: var(--warn);
-}
-.drive-meter.is-crit .drive-pct {
-  color: var(--danger);
-}
+/* The figure stays neutral at every tier: this screen's warm spend is
+   rationed to the low/critical tier WORDS (One Accent per Field), and the
+   reference ledger prints its status word in the signal hue while the
+   number beside it stays ink — color is never the only channel, because
+   the word sits right there and the aria-label carries the same math. */
 /* the tier word: the state the color names, printed in the same hue */
 .drive-state {
   flex: none;
@@ -297,7 +312,46 @@
   white-space: nowrap;
 }
 
-/* (e) the per-row action — .btn/.btn-primary from primitives carry it */
+/* (e) the per-row action — quiet at rest, revealed by the pointer over
+   the row OR by keyboard focus landing on the action, never accent-filled
+   (One Accent per Field: this screen's warm spend belongs to the
+   low/critical tier words). The reveal only paints background and color —
+   the Scan column's width is content-fixed, so nothing on the row moves. */
+.drive-scan {
+  background: transparent;
+  color: var(--ink-2);
+  white-space: nowrap;
+  transition:
+    background 120ms var(--ease-out),
+    color 120ms var(--ease-out);
+}
+.drive-row:hover .drive-scan,
+.drive-row:focus-within .drive-scan,
+.drive-scan:hover,
+.drive-scan:focus-visible {
+  background: var(--fill-hover);
+  color: var(--ink);
+}
+.drive-scan:active {
+  background: var(--fill-active);
+}
+/* Focus stays persistent and obvious while it sits here: the global
+   :focus-visible ring plus this revealed fill never time out. */
+.drive-scan:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+/* Touch / coarse pointers have no hover to reveal with: the action wears
+   its revealed state at rest — a fill step plus a 0.5px hairline pill —
+   so it is never lost to the users who cannot hover. Same tokens, no
+   accent, no layout change. */
+@media (hover: none) {
+  .drive-scan {
+    background: var(--fill-quiet);
+    color: var(--ink);
+    box-shadow: inset 0 0 0 0.5px var(--hairline);
+  }
+}
 
 /* ---- the legend: every state word, decoded once at the panel edge ---- */
 
@@ -328,24 +382,70 @@
 .lg-cell.is-crit {
   background: var(--danger);
 }
+/* dashed swatch = the no-reading key, matching the unknown bed */
+.lg-cell.is-unknown {
+  background: transparent;
+  border: 0.5px dashed var(--hairline-strong);
+}
+/* the method sentence stays on the ink-2 step: at 11.5px ink-3 lands at
+   ≈2.6:1 light / ≈3.6:1 dark on the panel — under AA — so the quietness
+   comes from its position at the end of the row, not from contrast */
 .lg-hint {
-  color: var(--ink-3);
+  color: var(--ink-2);
   margin-left: auto;
 }
 
-/* ---- query failure: raw message on a danger rule, selectable ---- */
+/* ---- query failure: a danger band inside the panel — the scan screen's
+    failure contract, restated: chip (dot + word) + one action, then the
+    engine's message verbatim and selectable. A fill tone, never a
+    colored box border. ---- */
 
-.drives-error {
+.drives-fail-band {
+  background: var(--danger-soft);
+  padding: 12px 20px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 2px 0 2px 12px;
-  border-left: 2px solid var(--danger);
+  gap: 9px;
+  min-width: 0;
 }
-.drives-error .micro {
-  color: var(--danger);
+.drives-fail-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
 }
-.drives-error-msg {
+.drives-fail-msg {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  margin: 0;
+  word-break: break-word;
+  user-select: text;
+}
+/* the alternative path, quiet, on the neutral panel foot */
+.drives-fail-note {
+  margin: 0;
+  padding: 11px 20px 14px;
+}
+
+/* ---- folder-dialog failure: attaches to its own action, so the volume
+    query is never blamed for the dialog ---- */
+
+.drives-pick-fail {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  max-width: 340px;
+  padding: 9px 11px;
+  background: var(--danger-soft);
+  border-radius: var(--r-ctl);
+}
+.drives-pick-fail-msg {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: 11px;

@@ -9,10 +9,14 @@
 //!
 //! On Windows the walk is a pool of workers running `FindFirstFileExW` directly
 //! (large-fetch mode, no per-file stat, reparse points skipped) fed from one
-//! shared directory queue. Names are accumulated as UTF-16 into a shared arena
-//! during the walk and materialized into `Node.name` once at finalize, so the
-//! per-file hot loop allocates nothing: no `OsString`, no lossy `String`, no
-//! lowercased extension.
+//! shared directory queue. Entries accumulate in a worker-local staging arena
+//! (UTF-16 names copied straight from the find data), and a whole batch — the
+//! files AND the subdirectories just discovered — reaches the shared store in
+//! ONE lock acquisition; those subdirectories are enqueued right after it, so
+//! the other workers fan out while the listing is still running. Names are
+//! materialized into `Node.name` once at finalize, so the per-file hot loop
+//! allocates nothing: no `OsString`, no lossy `String`, no lowercased
+//! extension, no shared lock.
 //!
 //! On other platforms `jwalk` (parallel via rayon, `follow_links(false)` so
 //! symlinks are never followed and never double counted) drives the same
@@ -39,6 +43,7 @@ use jwalk::{DirEntry, WalkDir};
 #[cfg(windows)]
 use parking_lot::Condvar;
 use parking_lot::Mutex as ParkingMutex;
+use rayon::prelude::*;
 use tauri::Emitter;
 
 #[cfg(windows)]
@@ -87,10 +92,12 @@ const SUB_ENTRIES: u32 = 8;
 const DEFAULT_CHILDREN_LIMIT: u32 = 100_000;
 
 /// How many queue items a worker drains per wake (batched handoff: far fewer
-/// lock round-trips and futex sleeps than one item per wake; the queue is fed
-/// one whole directory listing at a time, so small batches stay balanced).
+/// lock round-trips and futex sleeps than one item per wake). Large enough
+/// that a burst of discovered subdirectories reaches a single worker in one
+/// lock round-trip, small enough that the batch is handed back quickly when
+/// the tree turns narrow.
 #[cfg(windows)]
-const POP_BATCH: usize = 8;
+const POP_BATCH: usize = 32;
 
 /// Staged entries accumulate per worker until this many, then flush in one
 /// bulk append. Larger batches amortize the store lock over more directories
@@ -98,6 +105,12 @@ const POP_BATCH: usize = 8;
 /// discovery and never wait for a flush).
 #[cfg(windows)]
 const FLUSH_BATCH: usize = 512;
+
+/// Bit mask of [`FLUSH_BATCH`]: the walk hands its staging buffers over (and
+/// observes cancellation) exactly every `FLUSH_BATCH` enumerated entries, with
+/// no division.
+#[cfg(windows)]
+const FLUSH_MASK: u32 = (FLUSH_BATCH as u32) - 1;
 
 /// How the engine reports progress to the outside world.
 ///
@@ -161,16 +174,18 @@ struct WorkerCtx {
     nodes: Vec<Node>,
     /// `(local arena offset, len)` per staged node.
     spans: Vec<(u32, u32)>,
-    /// `(parent id, local node index)` per staged file; rebased to node ids
+    /// `(parent id, local node index)` per staged entry; rebased to node ids
     /// at flush.
     pairs: Vec<ChildPair>,
     /// Local top-file candidates `(size, node id)`. Kept per worker — no
     /// shared heap lock per file; merged once at finalize.
     top: Vec<(u64, u32)>,
-    /// Subdirectories discovered in the current listing, waiting to be
-    /// enqueued as one batch (drained into the queue under one lock).
+    /// Subdirectories discovered so far, staged TOGETHER with their node:
+    /// their global id is only assigned when the batch is appended to the
+    /// store (one lock per batch instead of one per subdirectory), and they
+    /// are enqueued in the same step (drained into the queue under one lock).
     #[cfg(windows)]
-    subdirs: Vec<WorkItem>,
+    subdirs: Vec<StagedSubdir>,
 }
 
 impl Default for WorkerCtx {
@@ -193,8 +208,13 @@ struct ScanData {
     root_id: u32,
     root_path: String,
     nodes: Vec<Node>,
-    /// Direct children of every node, indexed by node id.
-    children: Vec<Vec<u32>>,
+    /// CSR index of every node's direct children: `node_id`'s children are
+    /// `child_ids[child_offsets[node_id]..child_offsets[node_id + 1]]`.
+    /// Built in three O(n) passes over the (parent, child) log at finalize —
+    /// two flat arrays instead of one heap `Vec` (plus 24 bytes of `Vec`
+    /// header) per directory.
+    child_offsets: Vec<u32>,
+    child_ids: Vec<u32>,
     /// Per-category subtree totals of every node, indexed by node id, written
     /// by `finish_scan`'s reverse pass. Zeroed for files except their own
     /// bucket (so `get_category_totals(file_id)` still answers, like the old
@@ -212,6 +232,23 @@ struct ScanData {
     total_dirs: u64,
     errors: u64,
     elapsed_ms: u64,
+}
+
+/// Direct children of `node_id` in the CSR index: the slice
+/// `child_ids[child_offsets[node_id]..child_offsets[node_id + 1]]`, or empty
+/// for files and out-of-range ids (the same answer the old
+/// `children.get(id).map_or(0, len)` produced). O(1), no allocation.
+#[inline]
+fn children_of(data: &ScanData, node_id: u32) -> &[u32] {
+    let index = node_id as usize;
+    let (start, end) = match (
+        data.child_offsets.get(index),
+        data.child_offsets.get(index + 1),
+    ) {
+        (Some(&start), Some(&end)) if end >= start => (start as usize, end as usize),
+        _ => return &[],
+    };
+    data.child_ids.get(start..end).unwrap_or(&[])
 }
 
 /// Node arena plus the maps needed to answer tree queries.
@@ -432,10 +469,7 @@ impl Engine {
         } else {
             limit
         };
-        let total_entries = data
-            .children
-            .get(node_id as usize)
-            .map_or(0, |kids| kids.len());
+        let total_entries = children_of(&data, node_id).len();
 
         let sort_tag = if sort == "size" { SORT_SIZE } else { SORT_NAME };
         let sorted = self.sorted_child_ids(&data, node_id, sort_tag, scan_gen);
@@ -578,11 +612,7 @@ impl Engine {
             }
         }
         // Miss: sort with no cache lock held.
-        let mut ids = data
-            .children
-            .get(node_id as usize)
-            .cloned()
-            .unwrap_or_default();
+        let mut ids = children_of(data, node_id).to_vec();
         sort_child_ids(data, &mut ids, sort_tag == SORT_SIZE);
         let ids: Arc<[u32]> = ids.into();
         let mut cache = self.sorted_cache.lock();
@@ -597,15 +627,18 @@ impl Engine {
 // staging: bulk appends into the shared store
 // ---------------------------------------------------------------------------
 
-/// Moves a worker's staged buffers into the shared store; returns the
-/// (files, bytes) display counters for the batch. The critical section is a
-/// handful of bulk `extend`s — no per-entry locks, no hashing, no
-/// `DashMap` shard contention (PERF item 4; the old per-directory
-/// `children_map` insert built one heap `Vec<u32>` per directory inside the
-/// sharded map).
+/// Moves a worker's staged buffers into the shared store; returns the id the
+/// first appended node received (`base`) plus the (files, bytes) display
+/// counters for the batch. The critical section is a handful of bulk `extend`s
+/// — no per-entry locks, no hashing, no `DashMap` shard contention (PERF item
+/// 4; the old per-directory `children_map` insert built one heap `Vec<u32>`
+/// per directory inside the sharded map).
 ///
 /// Ids are assigned here from `nodes.len()` (under the lock), preserving the
-/// dense `nodes[id]` identity that the whole query layer relies on.
+/// dense `nodes[id]` identity that the whole query layer relies on. A caller
+/// that staged subdirectories learns their global ids from `base`: staged
+/// index + `base` is exactly the node id written above, so a subdirectory's id
+/// is already in the store before its work item can be popped by a peer.
 fn append_to_store(
     arena: &mut Vec<u16>,
     nodes: &mut Vec<Node>,
@@ -613,9 +646,9 @@ fn append_to_store(
     pairs: &mut Vec<ChildPair>,
     top: &mut Vec<(u64, u32)>,
     store: &SharedStore,
-) -> (u64, u64) {
+) -> (u32, u64, u64) {
     if nodes.is_empty() {
-        return (0, 0);
+        return (0, 0, 0);
     }
     let mut inner = store.lock();
     let base = inner.nodes.len() as u32;
@@ -651,7 +684,7 @@ fn append_to_store(
     inner
         .child_pairs
         .extend(pairs.drain(..).map(|(parent, index)| (parent, base + index)));
-    (file_count, byte_count)
+    (base, file_count, byte_count)
 }
 
 /// Name-byte encode helpers. Windows pushes real UTF-16 (it already has it
@@ -869,7 +902,7 @@ fn walk_callback(
     // One bulk append per listing (the listing runs on some rayon worker; the
     // staged buffers are thread-local until this point). Files/bytes counters
     // ride along instead of an atomic add per file.
-    let (files, bytes) = {
+    let (_base, files, bytes) = {
         let mut top_guard = top.lock();
         append_to_store(
             &mut ctx.arena,
@@ -1018,10 +1051,10 @@ fn elapsed_ms(engine: &Engine) -> u64 {
 /// Builds the finished scan and publishes it, then emits `scan://done`.
 ///
 /// This is the single pass where walk-time staging becomes query-ready data:
-/// names are materialized (one allocation per node, in bulk — the hot loop
-/// never allocated a name), the (parent, child) log becomes dense children
-/// lists in one pass, and the per-worker top lists merge into the global
-/// top-1000 with one sort.
+/// names are materialized (one allocation per node, on the rayon pool — the
+/// hot walk never allocated a name), the (parent, child) log becomes one flat
+/// CSR children index in three O(n) passes, and the per-worker top lists merge
+/// into the global top-1000 with one sort.
 fn finish_scan(
     engine: &Engine,
     events: &dyn ScanEvents,
@@ -1044,24 +1077,55 @@ fn finish_scan(
     let total_dirs = engine.dirs.load(AtomicOrdering::Relaxed);
     let total_errors = engine.errors.load(AtomicOrdering::Relaxed);
 
-    // Materialize names: one bulk pass, one allocation per node.
-    for (index, node) in nodes.iter_mut().enumerate() {
-        node.name = name_from_arena(&arena, spans[index]);
-    }
+    // Materialize names: one allocation per node, spread over the rayon pool.
+    // This is the only place names come into existence (the walk staged raw
+    // UTF-16), so on a multi-million-entry tree it is a pure N-malloc pass —
+    // exactly the kind of work that parallelizes for free. The span lookup is
+    // bounds-checked, so a malformed staging buffer degrades to an empty name
+    // instead of panicking.
+    nodes
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(index, node)| {
+            if let Some(&span) = spans.get(index) {
+                node.name = name_from_arena(&arena, span);
+            }
+        });
     // The arena is dead weight after materialization.
     drop(arena);
     drop(spans);
 
-    // Children lists in one pass over the (parent, child) log; node ids are
-    // dense so there is nothing to hash.
-    let mut children: Vec<Vec<u32>> = vec![Vec::new(); node_count];
-    for (parent, child) in child_pairs {
-        if let Some(slot) = children.get_mut(parent as usize) {
-            slot.push(child);
+    // Children index: one flat CSR pair built from the (parent, child) log in
+    // three O(n) passes (count → prefix sum → fill); node ids are dense, so
+    // there is nothing to hash. Replaces `Vec<Vec<u32>>`, which allocated at
+    // least one heap block PER DIRECTORY (plus a 24-byte header each) yet was
+    // only ever read as a slice.
+    let mut child_offsets: Vec<u32> = vec![0u32; node_count + 1];
+    for &(parent, _) in &child_pairs {
+        let parent = parent as usize;
+        if parent < node_count {
+            child_offsets[parent + 1] += 1;
         }
     }
+    for index in 0..node_count {
+        child_offsets[index + 1] += child_offsets[index];
+    }
+    let mut child_ids: Vec<u32> = vec![0u32; child_offsets[node_count] as usize];
+    {
+        // Fill cursor: one slot per node, advanced as its children land.
+        let mut cursor = child_offsets.clone();
+        for &(parent, child) in &child_pairs {
+            let parent = parent as usize;
+            if parent < node_count {
+                let slot = cursor[parent] as usize;
+                child_ids[slot] = child;
+                cursor[parent] += 1;
+            }
+        }
+    }
+    drop(child_pairs);
     for (index, node) in nodes.iter_mut().enumerate() {
-        node.kid_count = children[index].len() as u32;
+        node.kid_count = child_offsets[index + 1] - child_offsets[index];
     }
 
     // Reverse pass: every node is visited after all of its children (a child
@@ -1138,7 +1202,8 @@ fn finish_scan(
         root_id: 0,
         root_path,
         nodes,
-        children,
+        child_offsets,
+        child_ids,
         dir_totals,
         categories: categories.to_vec(),
         top_files,
@@ -1348,10 +1413,7 @@ fn sort_child_ids(data: &ScanData, ids: &mut [u32], by_size: bool) {
 /// Builds the `ChildEntry` for one node. Sub-entries are attached by the caller.
 fn build_entry(data: &ScanData, node_id: u32) -> ChildEntry {
     let node = &data.nodes[node_id as usize];
-    let kid_count = data
-        .children
-        .get(node_id as usize)
-        .map_or(0, |kids| kids.len());
+    let kid_count = children_of(data, node_id).len();
     ChildEntry {
         id: node_id,
         name: node.name.clone(),
@@ -1375,10 +1437,29 @@ struct WorkItem {
     /// built by extending a buffer, `dir_flags` parses the UTF-16 directly,
     /// and no `PathBuf`/`OsString` round-trip happens per directory.
     path: Vec<u16>,
-    /// Node id of the directory (assigned at discovery time — children need
-    /// it as their parent id before this worker flushes anything).
+    /// Node id of the directory, assigned when its batch is appended to the
+    /// store — always BEFORE the item is enqueued, so every child has a valid
+    /// parent id by the time any worker starts listing this directory.
     id: u32,
     depth: u32,
+    /// Classification flags of THIS directory, inherited from the parent plus
+    /// its own name (`classify::child_flags`) — the full path is never
+    /// re-scanned per directory.
+    flags: classify::DirFlags,
+}
+
+/// A subdirectory found while listing its parent, staged in the worker's
+/// buffers together with its node.
+#[cfg(windows)]
+struct StagedSubdir {
+    /// Child path (`parent + '\' + name`) as UTF-16, ready for
+    /// `FindFirstFileExW`.
+    path: Vec<u16>,
+    /// Index inside `WorkerCtx::nodes` while staged; rebased to the global
+    /// node id (`base + index`) when the batch is appended to the store.
+    index: u32,
+    /// The child's classification flags (parent flags + this name).
+    flags: classify::DirFlags,
 }
 
 /// Retires one in-flight directory. `active` counts queued + in-flight items;
@@ -1446,20 +1527,26 @@ pub fn run_walker_fast(
 
     {
         let mut q = queue.lock();
+        let root_utf16: Vec<u16> = root_path.encode_utf16().collect();
+        let root_flags = classify::dir_flags_utf16(&root_utf16);
         q.push_back(WorkItem {
-            path: root_path.encode_utf16().collect(),
+            path: root_utf16,
             id: 0,
             depth: 0,
+            flags: root_flags,
         });
         active.store(1, AtomicOrdering::Relaxed);
         // No notify: the workers are spawned right below and pick this up
         // immediately.
     }
 
+    // One worker per logical processor (capped): directory enumeration is
+    // kernel-bound, so extra threads hide per-directory syscall latency up to
+    // a point — past ~16 they only fight over the queue and the store lock.
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(8)
+        .min(16)
         .max(2);
 
     let mut handles = Vec::with_capacity(workers);
@@ -1577,7 +1664,7 @@ pub fn run_walker_fast(
 /// Flushes a worker's staged buffers and feeds the display counters.
 #[cfg(windows)]
 fn flush_worker(engine: &Engine, ctx: &mut WorkerCtx, store: &SharedStore) {
-    let (files, bytes) = append_to_store(
+    let (_base, files, bytes) = append_to_store(
         &mut ctx.arena,
         &mut ctx.nodes,
         &mut ctx.spans,
@@ -1609,15 +1696,95 @@ impl Drop for FindGuard {
     }
 }
 
+/// Publishes everything a worker has staged: ONE store append (which assigns
+/// the global ids of the staged subdirectories) followed by ONE queue push of
+/// exactly those subdirectories.
+///
+/// Called every [`FLUSH_BATCH`] entries while a listing runs and once more
+/// when it ends, so:
+/// - a listing's children fan out to the other workers mid-listing instead of
+///   only after its last `FindNextFile` (a 100k-entry folder no longer holds
+///   its own subdirectories back);
+/// - the shared store lock is taken once per batch instead of once per
+///   discovered subdirectory — the old per-subdirectory registration was the
+///   hottest contended lock of the walk;
+/// - ids are assigned under the store lock and only then enqueued, so a
+///   directory's id always exists before any worker lists it.
+///
+/// A no-op when nothing is staged or when the scan was cancelled (a cancelled
+/// walk publishes nothing and must never grow `active` again).
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn flush_staged(
+    engine: &Engine,
+    store: &SharedStore,
+    queue: &Arc<ParkingMutex<VecDeque<WorkItem>>>,
+    work_cv: &Condvar,
+    active: &AtomicU32,
+    parked: &AtomicU32,
+    depth: u32,
+    ctx: &mut WorkerCtx,
+) {
+    if ctx.nodes.is_empty() {
+        return;
+    }
+    if engine.cancel.load(AtomicOrdering::Relaxed) {
+        return;
+    }
+
+    let (base, files, bytes) = append_to_store(
+        &mut ctx.arena,
+        &mut ctx.nodes,
+        &mut ctx.spans,
+        &mut ctx.pairs,
+        &mut ctx.top,
+        store,
+    );
+    engine.files.fetch_add(files, AtomicOrdering::Relaxed);
+    engine.bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
+
+    if ctx.subdirs.is_empty() {
+        return;
+    }
+    // How many workers to wake for this batch. Each woken worker drains up to
+    // POP_BATCH items, so the batch needs `ceil(pushed / POP_BATCH)` of them,
+    // and never more than the pool has parked:
+    // - one wake (the old empty→non-empty rule) left the whole pool idle
+    //   behind a single worker during a wide burst;
+    // - blanket notify_all would futex-wake every sleeping thread each time a
+    //   deep, narrow branch discovered a single directory, and those threads
+    //   would immediately re-park — a syscall per directory for no work done.
+    let wake = {
+        let mut q = queue.lock();
+        let mut pushed = 0usize;
+        for staged in ctx.subdirs.drain(..) {
+            active.fetch_add(1, AtomicOrdering::Relaxed);
+            q.push_back(WorkItem {
+                path: staged.path,
+                id: base + staged.index,
+                depth: depth + 1,
+                flags: staged.flags,
+            });
+            pushed += 1;
+        }
+        pushed
+            .div_ceil(POP_BATCH)
+            .min(parked.load(AtomicOrdering::Relaxed) as usize)
+    };
+    for _ in 0..wake {
+        work_cv.notify_one();
+    }
+}
+
 /// Processes one directory listing on the Windows fast path.
 ///
-/// Per-file work is allocation-free: names are copied as UTF-16 into the
-/// worker's staging arena, classification runs on the find-data buffer, and
-/// sizes come straight out of `WIN32_FIND_DATAW` (no per-file stat
-/// anywhere). Per-directory work: one short store lock to register each
-/// subdirectory (id must exist before its listing runs), one short queue
-/// lock to enqueue them, and one bulk store append per FLUSH_BATCH staged
-/// entries.
+/// Per-file work is allocation-free and lock-free: names are copied as UTF-16
+/// into the worker's staging arena, classification runs on the find-data
+/// buffer with flags inherited from the work item, and sizes come straight out
+/// of `WIN32_FIND_DATAW` (no per-file stat anywhere). Per-directory work: one
+/// queue lock to hand over the subdirectories discovered so far, and one bulk
+/// store append every [`FLUSH_BATCH`] staged entries — both inside
+/// [`flush_staged`].
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn process_dir_fast(
@@ -1640,7 +1807,10 @@ fn process_dir_fast(
         *engine.current.lock() = String::from_utf16_lossy(&item.path);
     }
 
-    let flags = classify::dir_flags_utf16(&item.path);
+    // Inherited from the work item: the parent's flags plus this directory's
+    // own name, computed once when the parent was listed — the full path is
+    // never re-scanned here.
+    let flags = item.flags;
 
     // `dir\*` search pattern straight from the UTF-16 path.
     let mut pattern = Vec::with_capacity(item.path.len() + 2);
@@ -1683,28 +1853,26 @@ fn process_dir_fast(
             if attrs & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
                 let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
                 if is_dir {
-                    // Register the subdirectory NOW: its id is needed as the
-                    // parent id of everything inside it, by whichever worker
-                    // picks up its listing. Critical section: a few Vec
-                    // pushes, no hashing.
-                    let child_id = {
-                        let mut inner = store.lock();
-                        let id = inner.nodes.len() as u32;
-                        let offset = inner.arena.len() as u32;
-                        inner.arena.extend_from_slice(name);
-                        inner.spans.push((offset, name.len() as u32));
-                        inner.child_pairs.push((item.id, id));
-                        inner.nodes.push(Node {
-                            name: String::new(),
-                            parent: item.id,
-                            is_dir: true,
-                            size: 0,
-                            file_count: 0,
-                            cat: model::CAT_OTHER,
-                            kid_count: 0,
-                        });
-                        id
-                    };
+                    // Stage the subdirectory TOGETHER with its node: no store
+                    // lock and no id assignment here. The global id
+                    // (`base + index`) is handed out by the batch flush below
+                    // — still under the store lock — and the work item is only
+                    // enqueued afterwards, so a directory's id always exists
+                    // in the store before any worker can list it.
+                    let local_index = ctx.nodes.len() as u32;
+                    let offset = ctx.arena.len() as u32;
+                    ctx.arena.extend_from_slice(name);
+                    ctx.spans.push((offset, name.len() as u32));
+                    ctx.pairs.push((item.id, local_index));
+                    ctx.nodes.push(Node {
+                        name: String::new(),
+                        parent: item.id,
+                        is_dir: true,
+                        size: 0,
+                        file_count: 0,
+                        cat: model::CAT_OTHER,
+                        kid_count: 0,
+                    });
                     // Child search path = parent + '\'; one Vec alloc per
                     // directory (the queue owns it from here on).
                     let mut path = Vec::with_capacity(item.path.len() + 1 + name.len());
@@ -1713,10 +1881,11 @@ fn process_dir_fast(
                         path.push(b'\\' as u16);
                     }
                     path.extend_from_slice(name);
-                    ctx.subdirs.push(WorkItem {
+                    let child_dir_flags = classify::child_flags(flags, &path, name);
+                    ctx.subdirs.push(StagedSubdir {
                         path,
-                        id: child_id,
-                        depth: item.depth + 1,
+                        index: local_index,
+                        flags: child_dir_flags,
                     });
                     dir_count += 1;
                 } else {
@@ -1745,42 +1914,46 @@ fn process_dir_fast(
             break;
         }
         scanned += 1;
-        // Huge single directories shouldn't delay a cancel by their whole
-        // listing; one relaxed load every 8192 entries is free.
-        if scanned & 0x1FFF == 0 && engine.cancel.load(AtomicOrdering::Relaxed) {
-            break;
-        }
-    }
-
-    // Enqueue the discovered subdirectories BEFORE flushing this listing's
-    // files: subdir listings only need their id (already in the store), so
-    // other workers can fan out while this worker stages its file batch.
-    if !engine.cancel.load(AtomicOrdering::Relaxed) && !ctx.subdirs.is_empty() {
-        let need_wake = {
-            let mut q = queue.lock();
-            let was_empty = q.is_empty();
-            let parked_now = parked.load(AtomicOrdering::Relaxed);
-            for work in ctx.subdirs.drain(..) {
-                active.fetch_add(1, AtomicOrdering::Relaxed);
-                q.push_back(work);
+        // Mid-listing handoff: as soon as the batch is full, publish it — the
+        // subdirectories found so far reach the other workers while this
+        // listing is still running, staging memory stays bounded, and the
+        // relaxed cancel load rides along on the same branch (a huge single
+        // directory can no longer delay a cancel by its whole listing).
+        if scanned & FLUSH_MASK == 0 {
+            if engine.cancel.load(AtomicOrdering::Relaxed) {
+                break;
             }
-            was_empty && parked_now > 0
-        };
-        // Single-wake handoff: a non-empty queue always has a live drainer
-        // (workers park only on an empty queue), so a push only needs to wake
-        // someone when the queue WAS empty AND someone is parked (PERF item
-        // 5 — replaces the old notify_all stampede per directory).
-        if need_wake {
-            work_cv.notify_one();
+            flush_staged(
+                engine,
+                store,
+                queue,
+                work_cv,
+                active,
+                parked,
+                item.depth,
+                ctx,
+            );
         }
-    } else {
-        ctx.subdirs.clear();
     }
 
-    // Bulk store append when the staging buffer is full-ish (or at worker
-    // exit); the counters ride along.
-    if ctx.nodes.len() >= FLUSH_BATCH {
-        flush_worker(engine, ctx, store);
+    // Tail of the listing: publish when something MUST leave this worker now
+    // (a subdirectory to hand over, or a batch that grew past FLUSH_BATCH) —
+    // otherwise the staged entries stay local and land in a later flush, the
+    // same deferral the old code had for small leaf directories. That keeps
+    // the store lock at one per ~FLUSH_BATCH ENTRIES instead of one per
+    // directory. After a cancel this is a no-op — exactly like the old code,
+    // which dropped staged data outright.
+    if !ctx.subdirs.is_empty() || ctx.nodes.len() >= FLUSH_BATCH {
+        flush_staged(
+            engine,
+            store,
+            queue,
+            work_cv,
+            active,
+            parked,
+            item.depth,
+            ctx,
+        );
     }
     engine.dirs.fetch_add(dir_count, AtomicOrdering::Relaxed);
 }

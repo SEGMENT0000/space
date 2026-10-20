@@ -1,19 +1,20 @@
 /* ---------------------------------------------------------------
-   errors — the two failure surfaces: the render-boundary fallback
-   panel and the runtime toast. Resting rules apply everywhere EXCEPT
-   where a surface genuinely floats: the fallback is a dialog-like
-   panel that floats over the ground (it keeps .panel's own
-   --shadow-panel vocabulary), and the toast is a floating layer (it
-   reads as .float: elevated fill, --r-menu radius, --shadow-menu).
+   errors — the render-boundary fallback panel (the runtime toast
+   migrated to shell.css as the shared .toast family the moment
+   App.tsx started rendering <Toast> from ui.tsx — a matched rename:
+   one component, one style home, both slots). Resting rules apply
+   everywhere EXCEPT where a surface genuinely floats: the fallback
+   is a dialog-like panel that floats over the ground (it keeps
+   .panel's own --shadow-panel vocabulary).
    No gradient, no glass, no glow, no blink.
    WHY imported from ErrorBoundary.tsx rather than index.css: that
    manifest belongs to the lead, and the spec's pattern is
    component-owned stylesheets (previewPlate.ts → preview.css, §G).
    Contrast: every text pair below clears 4.5:1 in BOTH themes —
    math recorded next to each color (see report).
-   NOTE: .err-toast / .err-toast-key / .err-toast-msg / .err-toast-x
-   are load-bearing names — App.tsx renders them directly; rename
-   only with a matched App.tsx change.
+   NOTE: .err-boundary / .err-panel / .err-band / .err-body /
+   .err-actions are load-bearing names — ErrorBoundary.tsx renders
+   them directly; rename only with a matched component change.
    --------------------------------------------------------------- */
 
 /* --------------------------------------------------- boundary fallback
@@ -128,95 +129,4 @@
   gap: 8px;
   padding: 12px 16px 14px;
   border-top: 1px solid var(--hairline);
-}
-
-/* --------------------------------------------------- runtime toast
-   Names are load-bearing (App.tsx renders them). Values follow the
-   floating-layer vocabulary: elevated fill, --r-menu radius, the
-   menu shadow (which includes the 0.5px hairline ring — no border of
-   its own). Fixed bottom-RIGHT: right gutter mirrors the statusbar's,
-   and 42px up clears the 28px statusbar so it never lands on the
-   readouts — while staying on the opposite side from the bottom-left
-   gesture strip. No auto-dismiss: an error the user has not
-   acknowledged should not vanish on a timer (calm > tidy). */
-
-.err-toast {
-  position: fixed;
-  right: 14px;
-  bottom: 42px;
-  /* above context menus (60), below the palette scrim (80) — a modal
-     stays modal */
-  z-index: 70;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  max-width: min(460px, calc(100vw - 28px));
-  padding: 6px 8px 6px 12px;
-  background: var(--bg-elevated);
-  border-radius: var(--r-menu);
-  box-shadow: var(--shadow-menu);
-  animation: err-toast-in 120ms var(--ease-out) both;
-}
-@keyframes err-toast-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-}
-
-/* sentence-case key in the label voice, in --danger: a runtime error is
-   a real warning, the one place chrome spends the signal hue.
-   danger on elevated: 5.23:1 light, 4.85:1 dark */
-.err-toast-key {
-  flex: none;
-  font-family: var(--font-sans);
-  font-size: 11.5px;
-  font-weight: 500;
-  letter-spacing: 0.005em;
-  color: var(--danger);
-  white-space: nowrap;
-}
-
-/* the message is real data — mono, ellipsized (App already truncates at
-   ~140 chars); ink on elevated: 17.0:1 light, 16.3:1 dark */
-.err-toast-msg {
-  flex: 1 1 auto;
-  min-width: 0;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 1.45;
-  color: var(--ink);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  user-select: text;
-}
-
-/* small dismiss ×: transparent fill, ink-2 glyph (4.80:1 / 6.85:1 on
-   elevated), fill step on hover, --r-chip radius to match the control
-   family */
-.err-toast-x {
-  flex: none;
-  width: 20px;
-  height: 20px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border: none;
-  border-radius: var(--r-chip);
-  background: transparent;
-  font-family: var(--font-sans);
-  font-size: 14px;
-  line-height: 1;
-  color: var(--ink-2);
-  cursor: default;
-  transition: background 120ms var(--ease-out), color 120ms var(--ease-out);
-}
-.err-toast-x:hover {
-  background: var(--fill-hover);
-  color: var(--ink);
-}
-.err-toast-x:active {
-  background: var(--fill-active);
 }

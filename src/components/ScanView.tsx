@@ -4,28 +4,56 @@
 // no total, so a determinate percentage would be a fabrication. The honest
 // meter is indeterminate — an accent sweep on a dot-matrix bed — and the %
 // readout at its right end stays "—" with a title explaining why. Everything
-// else is verbatim payload: the scanned-bytes hero, the four counters, elapsed
-// riding the head's meta line, and the walking path. `errors` is the count of
-// entries the walk could not read — the product calls those "skipped".
+// else is verbatim payload: the scanned-bytes hero, the four counters, the
+// elapsed clock in its own fixed slot in the head, and the walking path.
+// `errors` is the count of entries the walk could not read — the product
+// calls those "skipped".
+//
+// ONE commit per THROTTLE_MS, never one per event: the Rust reporter emits
+// every 120 ms (scanner.rs PROGRESS_INTERVAL) while 16 walker threads
+// saturate the CPU, so every event folds into refs (sample window, EMA,
+// peak) and only a throttled commit carries a whole snapshot — payload
+// values included — into state. Render reads that snapshot and never the
+// changing `progress` prop, so a skipped commit changes nothing on screen
+// and loses nothing either (the refs already hold the newer fold).
 //
 // Rate is NOT in the payload: it is derived here from consecutive events (EMA
 // over files/second deltas, seeded by the overall average, because NTFS walks
-// burst; raw per-tick deltas would jitter the readout). The computation lives
-// in a ref-based effect and lands as ONE state write per event, so renders
-// stay pure and the render cadence never exceeds the event cadence (~8Hz).
-// The strip plots the RAW observed deltas (not the EMA) in a ref-held sliding
-// window whose bars are keyed by a stable monotonic sample index — a new
-// sample shifts the window one slot, so React mounts/unmounts a single bar
-// per event and never rebuilds the other 89.
+// burst; raw per-tick deltas would jitter the readout). The strip plots the
+// RAW observed deltas (not the EMA) in a ref-held sliding window whose bars
+// are keyed by a stable monotonic sample index — a new sample shifts the
+// window one slot, so React mounts/unmounts a single bar per commit and never
+// rebuilds the other 89.
 //
-// Failure contract: `error` (optional; App passes scanError) swaps the meter
-// for a danger band — status chip + the engine's message verbatim, selectable
-// because a technical user copies it — and trades Cancel for "Back to volumes"
-// (`onBack`, optional; absent means no action is offered). Frozen counters and
-// bars under a failure are the scan's last reported observations, kept honest.
+// Phases: idle (mounted, nothing reported yet) → scanning → cancelling (Cancel
+// pressed; the button says so and stops accepting presses; Escape is the same
+// action) → failed (`error` swaps the meter for a danger band — status chip +
+// the engine's message verbatim, selectable because a technical user copies it
+// — and trades Cancel for "Back to volumes"). Done is the shell's transition:
+// `scan://done` swaps the screen into the map. Under a failure the counters
+// and bars freeze on the scan's last reported observations, kept honest.
+//
+// Edge states are quiet words, never an overlay: a watchdog prints "No
+// progress reported for Ns" and parks the sweep (the instrument stops
+// claiming motion when motion stopped), an empty walk prints "0 files so far"
+// only once elapsed time makes that worth stating, and `errors` prints "N
+// entries could not be read" — permission-denied lands here, counted and
+// named in plain text, not thrown at the reader as a raw dump.
 
-import { useEffect, useRef, useState } from "react";
-import { formatCount, formatElapsed, splitBytes } from "../lib/format";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import {
+  ellipsizePath,
+  formatCount,
+  formatElapsed,
+  splitBytes,
+} from "../lib/format";
 import type { ProgressPayload } from "../lib/types";
 import { Btn } from "./ui";
 
@@ -50,6 +78,23 @@ const RATE_WINDOW = 90;
 /** Height quantization of the bars: flat tops in 1/14 steps — a step chart,
     not a smooth ramp; sub-pixel bar churn between events buys nothing. */
 const BAR_LEVELS = 14;
+/** Floor on the gap between rendered commits. The emitter runs at 120 ms, so
+    this never drops a real event; it bounds renders at 10 Hz if the cadence
+    ever tightens, which is the whole throttle: no per-event React work. */
+const THROTTLE_MS = 100;
+/** No first report by then → the quiet "nothing reported yet" line. Real
+    scans report within ~120 ms, so this only ever names a cold start. */
+const WAIT_MS = 900;
+/** Reports quiet for this long while still on this screen → the stall line,
+    and the sweep stops (a frozen strip and a moving sweep would disagree). */
+const STALL_MS = 2000;
+/** Elapsed before "0 files so far" is worth stating — it is true at 0 ms too,
+    but printing it on every fresh scan would flash a non-state. */
+const EMPTY_MS = 1500;
+/** Middle-truncation budget for the walking path: 72 mono chars fit the
+    620px panel's foot at every window size the shell allows (min 1024px);
+    the CSS ellipsis behind it is a last resort, not the plan. */
+const PATH_MAX = 72;
 
 /** One plotted sample. `k` is a monotonic sample index — also the bar's React
     key, so the sliding window never remounts bars it has already drawn. */
@@ -59,8 +104,16 @@ interface Sample {
   v: number;
 }
 
-/** Everything the instrument re-derives per progress event. */
-interface ScanLive {
+/** The one immutable snapshot render reads: payload fields plus everything
+    derived from them, committed together so counters, path and rate can
+    never disagree within a frame. */
+interface ScanSnap {
+  files: number;
+  dirs: number;
+  bytes: number;
+  errors: number;
+  current: string;
+  elapsedMs: number;
   /** last smoothed rate (files/s); null until the first trusted sample */
   rate: number | null;
   /** max of the plotted window (files/s) */
@@ -68,6 +121,9 @@ interface ScanLive {
   /** raw samples, oldest -> newest, capped at RATE_WINDOW (ref-copied) */
   bars: Sample[];
 }
+
+/** Shared empty window — one module-scope array, never allocated per render. */
+const NO_BARS: Sample[] = [];
 
 export function ScanView({
   root,
@@ -82,22 +138,51 @@ export function ScanView({
   onCancel: () => void;
   onBack?: () => void;
 }) {
-  const [live, setLive] = useState<ScanLive>({ rate: null, peak: 0, bars: [] });
-  const prevSampleRef = useRef<{ files: number; ms: number } | null>(null);
+  const [snap, setSnap] = useState<ScanSnap | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [waiting, setWaiting] = useState(false);
+  const [stalled, setStalled] = useState(0);
+  const screenRef = useRef<HTMLDivElement | null>(null);
+
+  const prevRef = useRef<{ files: number; ms: number } | null>(null);
   const smoothedRef = useRef(0);
-  // the window lives in a ref; state gets an immutable copy for render
+  // the window lives in a ref; each commit ships an immutable copy
   const barsRef = useRef<Sample[]>([]);
   const seqRef = useRef(0);
+  const lastCommitRef = useRef(0);
+  const lastReportRef = useRef(0);
 
+  const failed = !!error;
+
+  // --------------------------------------------------------- fold + throttle
   useEffect(() => {
-    if (!progress) return;
+    if (!progress) {
+      // the shell cleared the payload while we are mounted (a fresh scan is
+      // being set up): start the instrument over instead of holding the
+      // previous walk's numbers
+      prevRef.current = null;
+      smoothedRef.current = 0;
+      barsRef.current = [];
+      setSnap(null);
+      setStalled(0);
+      return;
+    }
     // StrictMode double-invokes effects: a payload already folded into the
-    // windows must not count twice. `elapsed_ms` strictly increases across
+    // windows must not count twice. `elapsedMs` strictly increases across
     // real events (and across demo ticks), so equal {files, ms} = same event.
-    const prev = prevSampleRef.current;
+    const prev = prevRef.current;
     if (prev && prev.ms === progress.elapsedMs && prev.files === progress.files)
       return;
-    prevSampleRef.current = { files: progress.files, ms: progress.elapsedMs };
+
+    const now = performance.now();
+    // a payload that went backwards is a NEW scan sharing our mount — clear
+    // the derived windows so the rate never averages two walks together
+    if (prev && (progress.elapsedMs < prev.ms || progress.files < prev.files)) {
+      smoothedRef.current = 0;
+      barsRef.current = [];
+    }
+    prevRef.current = { files: progress.files, ms: progress.elapsedMs };
+    lastReportRef.current = now;
 
     let inst: number | null = null;
     if (prev && progress.elapsedMs - prev.ms >= MIN_SAMPLE_MS) {
@@ -124,44 +209,167 @@ export function ScanView({
       smoothedRef.current = progress.files / (progress.elapsedMs / 1000);
     }
 
-    // window max, computed here so renders never iterate (no spread in render)
+    // window max, computed here so renders never iterate
     let peak = 0;
     for (const b of barsRef.current) if (b.v > peak) peak = b.v;
 
-    // ONE state write per progress event — the events' own cadence
-    setLive({
-      rate: smoothedRef.current === 0 ? null : smoothedRef.current,
-      peak,
-      bars: barsRef.current.slice(),
-    });
+    // throttled commit — the whole snapshot lands as one state write, so a
+    // fast emitter can never outrun the render cadence
+    if (now - lastCommitRef.current >= THROTTLE_MS) {
+      lastCommitRef.current = now;
+      setSnap({
+        files: progress.files,
+        dirs: progress.dirs,
+        bytes: progress.bytes,
+        errors: progress.errors,
+        current: progress.current,
+        elapsedMs: progress.elapsedMs,
+        rate: smoothedRef.current === 0 ? null : smoothedRef.current,
+        peak,
+        bars: barsRef.current.slice(),
+      });
+    }
   }, [progress]);
 
-  const failed = !!error;
-  // before the first event the walker is on the root itself — that is a real
-  // path, not a placeholder; `current` can also arrive "" early on
-  const path = progress?.current || root;
-  const { rate, peak, bars } = live;
-  const scanned = progress ? splitBytes(progress.bytes) : null;
+  // --------------------------------------------------------- idle gate
+  // "nothing reported yet" is only true while no payload has ever arrived;
+  // the delay keeps a normal 120 ms cold start from flashing it
+  useEffect(() => {
+    if (progress) {
+      setWaiting(false);
+      return;
+    }
+    const t = window.setTimeout(() => setWaiting(true), WAIT_MS);
+    return () => window.clearTimeout(t);
+  }, [progress]);
+
+  // --------------------------------------------------------- stall watchdog
+  const hasReport = snap !== null;
+  const live = hasReport && !error;
+  useEffect(() => {
+    if (!live) {
+      setStalled(0);
+      return;
+    }
+    const id = window.setInterval(() => {
+      const quiet = performance.now() - lastReportRef.current;
+      // whole seconds only: the state changes at 1 Hz, never per tick
+      setStalled(quiet >= STALL_MS ? Math.floor(quiet / 1000) : 0);
+    }, 500);
+    return () => window.clearInterval(id);
+  }, [live]);
+
+  // --------------------------------------------------------- cancel
+  const requestCancel = useCallback(() => {
+    setCancelling(true);
+    onCancel();
+  }, [onCancel]);
+
+  // Escape is the same action as the button while this screen owns the key.
+  // The overlay guard keeps the command palette's own Escape (its input is
+  // the event target then) from cancelling a scan on the way out.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.ctrlKey || e.metaKey || e.altKey) return;
+      const t = e.target as HTMLElement | null;
+      const onGround =
+        !t || t === document.body || t === document.documentElement;
+      if (!onGround && !screenRef.current?.contains(t)) return;
+      if (failed || cancelling) return;
+      e.preventDefault();
+      requestCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [failed, cancelling, requestCancel]);
+
+  // --------------------------------------------------------- render values
+  const path = snap?.current || root;
+  const scanned = snap ? splitBytes(snap.bytes) : null;
+  const rate = snap ? snap.rate : null;
+  const peak = snap ? snap.peak : 0;
+  const bars = snap ? snap.bars : NO_BARS;
+
+  // quiet status: observed facts only, in the product's own words. Never the
+  // failure itself (the danger band owns that), never a live region (these
+  // numbers move every commit — announcing them would flood a screen reader)
+  const notes: ReactNode[] = [];
+  if (stalled > 0) {
+    notes.push(
+      <span key="stall">
+        No progress reported for <span className="num">{stalled}</span>s
+      </span>,
+    );
+  } else if (waiting) {
+    notes.push(<span key="wait">No progress reported yet</span>);
+  } else if (snap && snap.files === 0 && snap.elapsedMs >= EMPTY_MS) {
+    notes.push(
+      <span key="empty">
+        <span className="num">0</span> files so far
+      </span>,
+    );
+  }
+  if (snap && snap.errors > 0) {
+    notes.push(
+      <span key="skip">
+        <span className="num">{formatCount(snap.errors)}</span>{" "}
+        {snap.errors === 1 ? "entry" : "entries"} could not be read
+      </span>,
+    );
+  }
 
   return (
-    <div className="screen fade-in">
+    <div className="screen fade-in" ref={screenRef}>
       <div className="scan">
         <section
           className="panel scan-panel"
-          aria-label={failed ? "Scan failed" : "Scan in progress"}
+          aria-label={
+            failed
+              ? "Scan failed"
+              : cancelling
+                ? "Cancelling the scan"
+                : "Scan in progress"
+          }
         >
-          {/* head: volume identity left, quiet cancel right */}
+          {/* head: volume identity left, the one action right */}
           <header className="scan-head">
             <div className="scan-id">
               <h1 className="scan-name" title={root}>
                 {leafFolder(root)}
               </h1>
-              <span className="scan-mount num" title={root}>
-                {root}
-                {progress ? ` · ${formatElapsed(progress.elapsedMs)}` : ""}
-              </span>
+              <div className="scan-mount-row">
+                <span className="scan-mount num" title={root}>
+                  {root}
+                </span>
+                {snap && (
+                  <>
+                    <span className="scan-sep" aria-hidden="true">
+                      ·
+                    </span>
+                    <span
+                      className="scan-elapsed num"
+                      title="Elapsed since the scan started"
+                    >
+                      {formatElapsed(snap.elapsedMs)}
+                    </span>
+                  </>
+                )}
+              </div>
             </div>
-            {!failed && <Btn onClick={onCancel}>Cancel</Btn>}
+            {!failed && (
+              <Btn
+                onClick={requestCancel}
+                disabled={cancelling}
+                title={cancelling ? "Cancel requested" : "Stop the scan (Esc)"}
+              >
+                {cancelling ? "Cancelling…" : "Cancel"}
+                {!cancelling && (
+                  <span className="kbd" aria-hidden="true">
+                    esc
+                  </span>
+                )}
+              </Btn>
+            )}
           </header>
 
           {/* failure band: chip + the engine's message verbatim + one action */}
@@ -183,14 +391,15 @@ export function ScanView({
 
           {/* hero: scanned bytes over an indeterminate meter on a dot bed.
               The meter row exists only while the scan is live — a frozen
-              fill would claim a progress state the payload cannot back. */}
+              fill would claim a progress state the payload cannot back —
+              and `is-stalled` parks the sweep when reports go quiet. */}
           <div className="scan-hero">
             <div className="stat is-hero">
               <span className="micro">Scanned</span>
               <span className="stat-v">
                 {scanned ? (
                   <>
-                    {scanned.num}
+                    <span className="slot">{scanned.num}</span>
                     <span className="u">{scanned.unit}</span>
                   </>
                 ) : (
@@ -201,7 +410,9 @@ export function ScanView({
             {!failed && (
               <div className="scan-meter-row">
                 <div
-                  className="scan-meter tex-dots"
+                  className={`scan-meter tex-dots${
+                    stalled > 0 ? " is-stalled" : ""
+                  }`}
                   role="progressbar"
                   aria-label="Scan progress"
                 >
@@ -218,18 +429,21 @@ export function ScanView({
             )}
           </div>
 
-          {/* counters: four cells divided by hairlines — never cards */}
+          {/* counters: four cells divided by hairlines — never cards. Each 1fr
+              cell IS the figure's fixed slot (tabular mono), so growing digits
+              never move a hairline; Rate carries a unit, so its figure sits in
+              a fixed ch slot that keeps "files/s" pinned as digits grow. */}
           <div className="scan-kpis">
             <div className="stat is-sm scan-kpi">
               <span className="micro">Files scanned</span>
               <span className="stat-v">
-                {progress ? formatCount(progress.files) : "—"}
+                {snap ? formatCount(snap.files) : "—"}
               </span>
             </div>
             <div className="stat is-sm scan-kpi">
               <span className="micro">Directories</span>
               <span className="stat-v">
-                {progress ? formatCount(progress.dirs) : "—"}
+                {snap ? formatCount(snap.dirs) : "—"}
               </span>
             </div>
             <div className="stat is-sm scan-kpi">
@@ -238,14 +452,19 @@ export function ScanView({
                 className="stat-v"
                 title="Entries the walk could not read"
               >
-                {progress ? formatCount(progress.errors) : "—"}
+                {snap ? formatCount(snap.errors) : "—"}
               </span>
             </div>
             <div className="stat is-sm scan-kpi">
               <span className="micro">Rate</span>
-              <span className="stat-v">
-                {rate === null ? "—" : fmtRate(rate)}
-                {rate !== null && <span className="u">files/s</span>}
+              <span
+                className="stat-v"
+                title="Files reported per second, smoothed across samples"
+              >
+                <span className="slot">
+                  {rate === null ? "—" : fmtRate(rate)}
+                </span>
+                <span className="u">files/s</span>
               </span>
             </div>
           </div>
@@ -256,15 +475,11 @@ export function ScanView({
             <div className="scan-rate-head">
               <span className="micro">Rate history</span>
               <span className="scan-peak">
-                {peak > 0 ? (
-                  <>
-                    <span className="micro">Peak</span>
-                    <span className="num">{fmtRate(peak)}</span>
-                    <span className="scan-peak-u">files/s</span>
-                  </>
-                ) : (
-                  <span className="num">—</span>
-                )}
+                <span className="micro">Peak</span>
+                <span className="num slot">
+                  {peak > 0 ? fmtRate(peak) : "—"}
+                </span>
+                <span className="scan-peak-u">files/s</span>
               </span>
             </div>
             <div
@@ -290,14 +505,26 @@ export function ScanView({
             </div>
           </div>
 
-          {/* walking readout: head-clipped so the entry under the walker
-              stays visible; the title attribute carries the path in full */}
+          {/* quiet status: empty walk, unreadable entries, quiet reporter —
+              one clipped line so it can never push the foot around */}
+          {!failed && notes.length > 0 && (
+            <p className="scan-status micro" aria-live="off">
+              {notes.map((n, i) => (
+                <Fragment key={i}>
+                  {i > 0 && " · "}
+                  {n}
+                </Fragment>
+              ))}
+            </p>
+          )}
+
+          {/* walking readout: middle-truncated to a fixed budget so the line
+              never overflows and never rewraps; the title attribute carries
+              the path in full */}
           <footer className="scan-foot">
             <span className="micro">Walking</span>
             <span className="scan-path num" title={path}>
-              {/* the LRM pins trailing neutrals ("C:", "C:\\") to the LTR run —
-                  without it the rtl head-clip mirrors them into ":C" */}
-              {path + "\u200e"}
+              {ellipsizePath(path, PATH_MAX)}
             </span>
           </footer>
         </section>

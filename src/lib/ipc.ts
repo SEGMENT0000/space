@@ -86,13 +86,19 @@ export function getChildren(
   );
 }
 
+/** Invokes the `get_preview(path)` Tauri command (signature stable: one
+ *  `path` arg, one `PreviewPayload` result). Never rejects with a raw value:
+ *  the Rust side rejects with a bare String, so failures are normalized to a
+ *  real `Error` here — preview.ts owns the retry/failure policy and only ever
+ *  sees an Error instance. */
 export function getPreview(path: string): Promise<PreviewPayload> {
   // Demo branch first (getChildren template): the browser build answers from
   // the synthesized dataset and never touches the wire.
   if (demo) return Promise.resolve(demo.getPreview(path));
-  // No catch here on purpose — preview.ts owns failure handling (resolves
-  // null on error, never caches a failure).
-  return invoke<PreviewPayload>("get_preview", { path });
+  return invoke<PreviewPayload>("get_preview", { path }).catch((err: unknown) => {
+    if (err instanceof Error) throw err;
+    throw new Error(typeof err === "string" && err ? err : "preview request failed");
+  });
 }
 
 /** Opens the native folder picker and resolves the chosen absolute path, or

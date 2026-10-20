@@ -8,8 +8,11 @@
    Interiors are hairline-stacked sections at 14px 16px; the ONLY scroll
    region is the largest-files list, so the hero figure and the toggles
    never leave view. Type register: labels are sentence-case Geist —
-   mono tabular (.num) is for figures and paths only. No cards-in-cards,
-   no resting shadows, no gradients, no uppercase-mono labels.
+   section titles 11.5/500 ink-2, the item name 14/500, rows 12.5/16;
+   mono tabular (.num) is for figures, the rank index and paths only.
+   No cards-in-cards, no resting shadows, no gradients, no uppercase-mono
+   labels. Quiet states: static --fill-quiet skeletons while loading (no
+   shimmer), EmptyState for no data, a StatusWord + message for failure.
    --------------------------------------------------------------- */
 
 .rail {
@@ -73,12 +76,14 @@
   padding-bottom: 10px;
 }
 
-/* Section titles are sentence-case Geist, not tracked mono-caps: the label
-   names the group; the mono figure on the right carries the value. */
+/* Section titles are sentence-case Geist at the label voice — 11.5/500
+   ink-2, never tracked mono-caps: the label names the group; the mono
+   figure on the right carries the value. */
 .rail-title {
   font-family: var(--font-sans);
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.005em;
   color: var(--ink-2);
   margin: 0 0 10px;
   display: flex;
@@ -110,21 +115,22 @@
 }
 
 /* Quiet sentence-case line naming the readout mode (Selection / 3 items
-   selected / Current folder) — Geist 12px 500 ink-2, one step below the
-   name, never mono-caps. */
+   selected / Current folder) — the section-title voice, Geist 11.5px 500
+   ink-2, one step below the name, never mono-caps. */
 .sel-label {
   font-family: var(--font-sans);
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 500;
   line-height: 1.3;
   letter-spacing: 0.005em;
   color: var(--ink-2);
 }
-/* The item name: title step, ellipsized — the readout is fixed-height, so
-   it clips rather than reflows. */
+/* The item name: title step (14/500), ellipsized — the readout is
+   fixed-height, so it clips rather than reflows; the mono path line below
+   carries the tail-true identity. */
 .sel-name {
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 500;
   line-height: 1.25;
   white-space: nowrap;
   overflow: hidden;
@@ -150,20 +156,22 @@
   gap: 4px;
   min-width: 0;
 }
-/* Path: mono 10.5 ink-3, one line, tail-true via ellipsizePath() in the
-   component (head+tail kept, ellipsis in the middle); CSS ellipsis is the
-   backstop for extreme widths. */
+/* Path: mono 10.5 ink-2 (the quietest step that still clears 4.5:1 — a
+   path is data, not decoration), one line, tail-true via ellipsizePath()
+   in the component (head+tail kept, ellipsis in the middle); CSS ellipsis
+   is the backstop for extreme widths. */
 .sel-path {
   font-size: 10.5px;
-  color: var(--ink-3);
+  color: var(--ink-2);
   line-height: 1.4;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-/* Readout actions share the rows' icon-button voice (28px squares); no
-   native tooltips — accessible names come from aria-label. */
+/* Readout actions share the rows' icon-button voice (28px squares) via
+   the shared IconButton: title + aria-label both present — DESIGN's
+   icon-button rule. */
 .sel-actions {
   display: flex;
   align-items: center;
@@ -244,8 +252,9 @@
 .cat-row.is-off .cat-lbl {
   color: var(--ink-3);
 }
-/* Figures: mono tabular via .num; a fixed minimum keeps the pct column on
-   one axis down the list. */
+/* Figures: mono tabular via .num; fixed minima keep the size and share
+   columns on one axis down the list. Share rides ink-2 (AA at 11px — the
+   ink-3 step fails 4.5:1 on both appearances, and this is live data). */
 .cat-size {
   font-size: 11px;
   color: var(--ink-2);
@@ -255,7 +264,7 @@
 }
 .cat-pct {
   font-size: 11px;
-  color: var(--ink-3);
+  color: var(--ink-2);
   min-width: 38px;
   text-align: right;
   white-space: nowrap;
@@ -285,9 +294,12 @@
 
 /* --------------------------------------------------- largest files */
 
+/* The rank row: mono rank index · tail-true name · mono size on a shared
+   right axis. 12.5/16 type at a 28px row; the rank column is fixed so the
+   name and size axes never move as the filter rewrites the list. */
 .file-row {
   display: grid;
-  grid-template-columns: 14px minmax(0, 1fr) 62px;
+  grid-template-columns: 16px minmax(0, 1fr) 62px;
   align-items: center;
   gap: 8px;
   height: 28px;
@@ -296,6 +308,7 @@
   background: transparent;
   font: inherit;
   font-size: 12.5px;
+  line-height: 16px;
   color: var(--ink);
   text-align: left;
   padding: 0 8px;
@@ -312,13 +325,15 @@
 .file-row.is-sel {
   background: var(--accent-soft);
 }
-.file-ico {
-  color: var(--ink-3);
-  display: flex;
-  justify-content: center;
+/* Rank index: micro mono tabular (AA at ink-2), zero-padded so the column
+   holds one width from 01 to 30. aria-hidden in the markup — AT reads
+   list order, and a bare "01" would announce as noise. */
+.file-rank {
+  font-size: 10.5px;
+  color: var(--ink-2);
+  letter-spacing: 0.02em;
 }
 .file-nm {
-  line-height: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -332,19 +347,123 @@
   white-space: nowrap;
 }
 
-/* Empty states are messages, not annotations — ink-2 clears 4.5:1. */
-.rail-empty {
+/* --------------------------------------------------- quiet states */
+
+/* Failure: a StatusWord plus the engine's own message — quiet, in-flow,
+   and selectable. Never an overlay; the danger tone is rationed to real
+   errors exactly like the rest of the color budget. */
+.rail-error {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0 0 12px;
+}
+.rail-error .status-word {
+  font-size: 11.5px;
+  letter-spacing: 0.005em;
+}
+.rail-error-msg {
+  margin: 0;
   font-family: var(--font-sans);
-  font-size: 12px;
+  font-size: 11.5px;
   line-height: 1.4;
-  color: var(--ink-2);
-  margin: 2px 0;
-  padding: 1px 8px 3px;
+  color: var(--ink-2); /* AA: ink-2 is 4.80 / 6.85 on this surface */
+  overflow-wrap: anywhere; /* paths in engine messages wrap, never bleed */
+}
+
+/* Empty regions are the shared EmptyState, compacted to the rail's
+   density; its title/hint keep the shell's ink steps (ink / ink-2, both
+   ≥4.5:1) — an empty state is body copy, never a decorative whisper. */
+.rail .empty {
+  padding: 18px 10px;
+  gap: 6px;
+}
+
+/* Loading: static skeleton rows in --fill-quiet. No shimmer, no pulse —
+   a skeleton that sits still is honest about not knowing (and the global
+   reduced-motion clamp would freeze any animation anyway). Geometry
+   mirrors the real rows so nothing jumps when the data lands. */
+.rail-skel {
+  display: block;
+}
+.rail-skel .sk {
+  display: block;
+  background: var(--fill-quiet);
+  border-radius: 3px;
+}
+/* Categories: the meter row's two-line geometry — swatch/label/value,
+   then the 4px share bed beneath. */
+.skel-cats .sk-row {
+  padding: 2px 8px;
+  margin: 0 -8px;
+}
+.skel-cats .sk-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.skel-cats .sk-sw {
+  width: 10px;
+  height: 10px;
+  flex: none;
+}
+.skel-cats .sk-nm {
+  height: 10px;
+  flex: 1;
+  max-width: 88px;
+}
+.skel-cats .sk-vl {
+  width: 46px;
+  height: 10px;
+  flex: none;
+  margin-left: auto;
+}
+.skel-cats .sk-bar {
+  height: 4px;
+  margin-top: 3px;
+  width: 100%;
+}
+/* Varied widths so eight rows don't read as one repeated stamp. */
+.skel-cats .sk-row:nth-child(2n) .sk-nm {
+  max-width: 64px;
+}
+.skel-cats .sk-row:nth-child(3n) .sk-nm {
+  max-width: 104px;
+}
+/* Largest files: the 28px rank-row grid, cell for cell. */
+.skel-files .sk-row {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) 62px;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 8px;
+  margin: 0 -8px;
+}
+.skel-files .sk-rk {
+  width: 13px;
+  height: 8px;
+}
+.skel-files .sk-nm {
+  height: 8px;
+  width: 66%;
+}
+.skel-files .sk-vl {
+  width: 46px;
+  height: 8px;
+  justify-self: end;
+}
+.skel-files .sk-row:nth-child(3n) .sk-nm {
+  width: 44%;
+}
+.skel-files .sk-row:nth-child(3n + 2) .sk-nm {
+  width: 82%;
 }
 
 /* Filter field reuses the toolbar search language, scaled to the rail:
    26px, sunken fill, control radius; focus = elevated fill + the system's
-   2.5px ring at a 0.5px hairline core. */
+   2.5px ring at a 0.5px hairline core. The wrapper's ink-2 colors the
+   glyph (the icon is an affordance: ≥3:1, and ink-2 clears 4.5). */
 .rail-search {
   flex: none;
   display: flex;
@@ -356,7 +475,7 @@
   margin: 0 0 8px;
   border-radius: var(--r-ctl);
   background: var(--fill-quiet);
-  color: var(--ink-3);
+  color: var(--ink-2);
   transition: background 120ms var(--ease-out);
 }
 .rail-search:focus-within {
@@ -369,11 +488,18 @@
   border: none;
   outline: none;
   background: transparent;
-  /* The wrapper's ink-3 colors the glyph only; typed text must hold the
+  /* The wrapper's ink-2 colors the glyph only; typed text must hold the
      ink step or the query reads as a placeholder. */
   color: var(--ink);
   font-size: 12px;
   font-family: var(--font-sans);
+}
+/* The placeholder is body text: primitives' global ink-3 step lands at
+   ≈2.6:1 light / 3.6:1 dark on this bed, under the 4.5 floor — scoped
+   here to ink-2 (4.80 / 6.85). opacity guards UA alpha on older engines. */
+.rail-search input::placeholder {
+  color: var(--ink-2);
+  opacity: 1;
 }
 
 /* The list: the rail's ONLY scroll region. scrollbar-gutter keeps the row
@@ -390,4 +516,22 @@
   scrollbar-gutter: stable;
   margin: 0 -8px;
   padding: 0 8px 4px;
+  /* The list's scrollbar, pinned in this file: the global theme
+     (primitives.css) says the same words today, but the rail owns its one
+     scroll region outright — gutter width and thumb language can never
+     drift from the hairlines the rest of the panel draws. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--hairline-strong) transparent;
+}
+.rail-list::-webkit-scrollbar {
+  width: 9px;
+}
+.rail-list::-webkit-scrollbar-thumb {
+  background: var(--hairline-strong);
+  border-radius: 99px;
+  border: 2.5px solid transparent;
+  background-clip: content-box;
+}
+.rail-list::-webkit-scrollbar-track {
+  background: transparent;
 }

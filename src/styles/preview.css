@@ -5,14 +5,16 @@
    React, so nothing here enters the render path.
 
    World: every plate is one small instrument mounted on the tile fill —
-   a deep sunken chassis (plate edge + head strip) carrying an elevated
-   readout bed (text / list / meta) or a sunken content bed (hex / image
-   / media). Radius comes from --r-plate; every divider is a hairline;
-   no gradient, no glass, no glow, no resting shadow (§4); nothing here
-   scrolls and nothing takes pointer events (map gestures win,
-   integrator note 1). Both themes resolve entirely through tokens.css
-   vars; readable ≤11px text rides --ink-2 (≥4.5:1 on the elevated beds,
-   ≈4.5:1 on the sunken chassis) with weight, not colour, for hierarchy.
+   the §2.0 shared frame (--bg-elevated ground, radius 0, no shadow,
+   0.5px solid --hairline-strong edge, 4px inset, 22px head / 28 at
+   tile-w ≥ 320) carrying an elevated readout bed (text / list / meta)
+   or a sunken content bed (hex / image / media). Every divider is a
+   hairline; no gradient, no glass, no glow, no resting shadow (§4);
+   nothing here scrolls and nothing takes pointer events (map gestures
+   win, integrator note 1). Both themes resolve entirely through
+   tokens.css vars; readable ≤11px text rides --ink-2 (≥4.5:1 on the
+   elevated beds, ≈4.5:1 on the sunken beds) with weight, not colour,
+   for hierarchy.
    --------------------------------------------------------------- */
 
 /* Layer div the renderer creates. pointer-events:none so map pan
@@ -42,11 +44,12 @@
   height: calc(var(--tile-h, 0px) - 8px);
   display: flex;
   flex-direction: column;
-  /* deep chassis: the plate reads as an instrument mounted on the tile
-     fill — the families' own beds layer on top of it */
-  background: var(--bg-sunken);
+  /* §2.0 shared frame: elevated ground, square, flat — an instrument
+     mounted on the tile fill; the families' own beds (sunken for
+     hex/image/media) layer on top of it */
+  background: var(--bg-elevated);
   border: 0.5px solid var(--hairline-strong);
-  border-radius: var(--r-plate);
+  border-radius: 0; /* §2.0/§4.2: plates are square, never rounded cards */
   box-shadow: none; /* §4.2: plates never rest on a shadow */
   overflow: hidden;
   pointer-events: none; /* map gestures always win */
@@ -55,6 +58,23 @@
    also wins, so either toggle convention the renderer picks works) */
 .tm-prev[hidden] {
   display: none;
+}
+
+/* §2.4 proportion cap — the META family (payload cards AND the fallback
+   metadata card; both carry data-family="meta", written by fillPlate/
+   paintTileMetaCard — the dots fallback REMOVES the marker, so it is
+   never capped) is a readout, not a sheet: past 460×340 it reads as an
+   empty box (live shot: pagefile.sys at ~720×600 carrying five short
+   rows). width/height above are calc(var(--tile-*) − 8px) BORDER-BOX
+   values, so max-* clamps the used box cleanly and the flex head/body
+   recompute from it — the element clamps, the top/left anchor (the 4px
+   inset) never moves. Mirrored by META_CAP_W/META_CAP_H in
+   previewPlate.ts (the row math must clamp with the box): change both.
+   No other family is capped — LIST/DB are bounded by the canvas, the
+   rest fill their box by nature. */
+.tm-prev[data-family="meta"] {
+  max-width: 460px;
+  max-height: 340px;
 }
 
 .tm-prev__head {
@@ -70,9 +90,10 @@
   height: 28px;
 }
 .tm-prev__name {
+  flex: 1 1 auto; /* the name owns its measure; the meta yields first */
   font-family: var(--font-mono);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 500; /* §2.0: name mono 11/500, ellipsized */
   color: var(--ink);
   white-space: nowrap;
   overflow: hidden;
@@ -81,13 +102,16 @@
 }
 .tm-prev__meta {
   margin-left: auto;
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: 10.5px;
   font-weight: 500;
   color: var(--ink-2);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .tm-prev__body {
   flex: 1;
@@ -383,6 +407,78 @@
   white-space: nowrap; /* rows never wrap; the 7ch track fits formatBytes' widest output */
 }
 
+/* --------------------------------------------------- DB (§2.3)
+   Schema list (table · columns) on top — reusing the LIST keys/row
+   classes under a local `--cols` — then, when the payload carries real
+   rows, a dense per-table grid: declaration-order column headers + the
+   delivered display-text cells. 18px rows, mono 10.5, no wrap, no
+   scrollbar, 24-col cap in TS; `--grid-cols` is written per group
+   (repeat(n, minmax(0,1fr))) so every cell clips inside its track. */
+.tm-db__schema {
+  flex: none;
+}
+.tm-db__grid {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.tm-db__group {
+  flex: none;
+  min-height: 0;
+}
+.tm-db__group + .tm-db__group {
+  border-top: 1px solid var(--hairline);
+}
+.tm-db__tname {
+  height: 16px;
+  line-height: 16px;
+  padding: 0 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--ink-2);
+  background: var(--fill-quiet);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tm-db__head {
+  height: 16px;
+  display: grid;
+  grid-template-columns: var(--grid-cols, 1fr);
+  align-items: center;
+  padding: 0 8px;
+  background: var(--fill-quiet);
+  border-bottom: 1px solid var(--hairline);
+}
+.tm-db__row {
+  height: 18px;
+  display: grid;
+  grid-template-columns: var(--grid-cols, 1fr);
+  align-items: center;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--hairline);
+}
+.tm-db__cell {
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+  font-weight: 400;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-right: 8px;
+}
+.tm-db__cell.is-key {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--ink-2);
+}
+
 /* --------------------------------------------------- META (§2.4)
    TARGET INSPECTOR pattern: padded readout, ONE capped hero `.stat`,
    kv rows carved by hairlines, optional rotated edge rail carrying a
@@ -410,7 +506,9 @@
 }
 .tm-meta__kv {
   display: grid;
-  grid-template-columns: 72px minmax(0, 1fr); /* 72px: real keys like "original size" fit */
+  /* §2.4: key column 64px; minmax(0,1fr) is `1fr` that can shrink, so a
+     long value ellipsizes inside its track instead of widening the grid */
+  grid-template-columns: 64px minmax(0, 1fr);
   column-gap: 8px;
   height: 18px;
   align-items: center;
@@ -456,6 +554,21 @@
   border: 0.5px solid var(--hairline); /* keyed swatch edge, R6/R9 */
   vertical-align: middle;
 }
+/* degraded-card reason line (§2.4 honesty): the payload's leading `note`
+   pair, verbatim — mono --ink-2 carved by a hairline, never a bare dash
+   and never a kv row (the reason is the card's story, not a field). */
+.tm-meta__reason {
+  height: 18px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 /* right-edge rail (§2.4): tile-w ≥ 360 AND tile-h ≥ 240, ONE live
    datum, rotated −90° (reads bottom→top), cut whole when it doesn't
    fit exactly — TS measures and removes; never clipped mid-glyph */
@@ -489,13 +602,30 @@
    Inert instrument plate: the binding law gives plates no pointer
    events, so there are no native transport controls — video shows its
    real first frame (framed like IMAGE), audio gets a centred stat; the
-   one datum either way is the file's real duration (formatElapsed). */
+   parsed container facts (duration/codec/channels/…) ride an elevated
+   kv bed in the plate's lower band (≤40% of the body, meta rhythm). */
 .tm-media {
   background: var(--bg-sunken);
+  display: flex;
+  flex-direction: column;
+}
+.tm-media__view {
+  position: relative; /* anchors the duration stamp overlay */
+  flex: 1;
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 8px;
+}
+.tm-media__pairs {
+  flex: none;
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--hairline);
+  padding: 6px 8px; /* rows stay the 18px kv rhythm — no row gap */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 .tm-media__el {
   display: block;

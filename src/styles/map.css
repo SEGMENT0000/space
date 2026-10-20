@@ -17,6 +17,10 @@
   position: absolute;
   inset: 0;
   pointer-events: none;
+  /* Local stacking ladder inside the map panel: instruments (4) sit under
+     the map chips (5/6, explorer.css). --z-content (10) is the APP-level
+     token for this layer class and would invert that in-panel order, so the
+     local step is deliberate. */
   z-index: 4;
 }
 
@@ -24,7 +28,7 @@
    --hairline-strong; this only seats them just inside the map field */
 .map-crop {
   position: absolute;
-  inset: 8px;
+  inset: var(--space-2);
   pointer-events: none;
 }
 
@@ -32,17 +36,19 @@
    fitted view (opacity 0) — the fit scale is the zoom floor, so 100% is
    the floor and the chip only speaks above 100%. Opacity is toggled by
    the draw loop (updateInstruments), not by React.
-   --ink-2, not --ink-3: at 10px the 4.5:1 floor applies, and ink-3 over
-   this chip bed (ink over --bg-elevated: #ffffff light / #1f1f22 dark)
-   lands at 2.35:1 (light) / 2.90:1 (dark) — ink-2 composites to 4.74:1
-   (light) / 5.81:1 (dark), the same small-text fix preview.css made. */
+   --ink-2, not --ink-3: at 10.5px (--fs-xs) the 4.5:1 floor applies, and
+   ink-3 over this chip bed (ink over --bg-elevated: #ffffff light /
+   #1f1f22 dark) lands at 2.35:1 (light) / 2.90:1 (dark) — ink-2 composites
+   to 4.74:1 (light) / 5.81:1 (dark), the same small-text fix preview.css
+   made. The fade is the state-change step: --dur-fast over --ease-state,
+   and primitives.css collapses it to 0.01ms under prefers-reduced-motion. */
 .map-zoom {
   position: absolute;
-  right: 20px;
-  bottom: 20px;
+  right: var(--space-5);
+  bottom: var(--space-5);
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 10px;
+  font-size: var(--fs-xs);
   letter-spacing: 0.05em;
   color: var(--ink-2);
   background: var(--bg-elevated);
@@ -50,5 +56,5 @@
   border-radius: 5px;
   padding: 2px 6px;
   opacity: 0;
-  transition: opacity 200ms var(--ease-out);
+  transition: opacity var(--dur-fast) var(--ease-state);
 }

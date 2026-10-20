@@ -1,13 +1,20 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import "./index.css";
-import App from "./App";
+import App, { resolveTheme } from "./App";
 
 // Never restore scroll positions (the dev reloads make them stale) — manual
 // mode keeps each launch opening at the very top.
 if ("scrollRestoration" in history) {
   history.scrollRestoration = "manual";
 }
+
+// Paint the resolved theme BEFORE React mounts. The token blocks ship light
+// at :root, so without this the dark-first window flashed light for a frame
+// while App's state initializer ran after first paint. resolveTheme is the
+// one source of truth (deep link > stored > dark) — same function App's
+// useState uses, so the DOM and the first render can never disagree.
+document.documentElement.dataset.theme = resolveTheme();
 
 // Surface runtime errors on-screen during dev/screenshot runs instead of a blank
 // page. DEV-only: production builds use the ErrorBoundary + quiet toast funnel

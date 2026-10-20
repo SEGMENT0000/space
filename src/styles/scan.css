@@ -1,15 +1,18 @@
 /* ---------------------------------------------------------------
    Scan — the in-flight screen (ScanView.tsx). One floating
    instrument panel, centered on the ground: a head band (volume
-   identity + quiet cancel), a hero figure over an indeterminate
-   meter on a dot-matrix bed, a hairline-divided counters row, a
-   rate-history strip of stepped ink bars on a second dot bed, and
-   the walking path at the foot. Hairlines are the only interior
+   identity, elapsed clock, the one action), a hero figure over an
+   indeterminate meter on a dot-matrix bed, a hairline-divided
+   counters row, a rate-history strip of stepped ink bars on a
+   second dot bed, a quiet status line for edge states, and the
+   walking path at the foot. Hairlines are the only interior
    structure — no cards, no nested surfaces. The only saturated
    pixels are the meter's accent sweep (the scan's live action)
    and the danger band that replaces it on failure. ProgressPayload
    carries no total, so the meter never claims a width-percentage;
-   the bars plot raw observed deltas, quantized to flat steps.
+   the bars plot raw observed deltas, quantized to flat steps, and
+   every live figure that carries a unit sits in a fixed-width slot
+   so digits growing can never move what follows them.
    --------------------------------------------------------------- */
 
 /* the screen: the panel centers on both axes via margin:auto, which degrades
@@ -46,6 +49,7 @@
   min-width: 0;
 }
 .scan-id {
+  flex: 1 1 auto; /* the id absorbs every spare pixel and all the shrinking */
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -63,16 +67,50 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* mount + elapsed: mono 10.5 in ink-3 — ambient readouts, not labels;
-   tabular digits keep the ticking seconds from nudging the line */
-.scan-mount {
-  font-size: 10.5px;
-  color: var(--ink-3);
+/* mount + elapsed: mono 10.5 in ink-2 — ambient readouts, not labels, but
+   ink-3 misses AA at this size in both themes. The root ellipsizes inside
+   its own flex room while the clock sits in a fixed 8ch slot, so a longer
+   path or a longer elapsed can never push the other one around. */
+.scan-mount-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   min-width: 0;
-  max-width: 100%;
+}
+.scan-mount {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--ink-2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.scan-sep {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--ink-2);
+}
+.scan-elapsed {
+  flex: none;
+  min-width: 8ch; /* "100m 02s" worst case — the root's room never changes */
+  font-size: 10.5px;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+/* the one action: quiet by family (transparent-at-rest discipline), edged
+   with a hairline so it is findable at a glance; hover/active still step
+   through the .btn primitive's fills. flex:none — a long root path must
+   shrink the id's ellipsis, never squeeze the button's label */
+.scan-head .btn {
+  flex: none;
+  border: 0.5px solid var(--hairline-strong);
+}
+/* the keycap hint sits at 10.5px, where the primitive's ink-3 falls under
+   AA in both themes — this instance states a real shortcut, so ink-2 */
+.scan-head .btn .kbd {
+  color: var(--ink-2);
 }
 
 /* --------------------------------------------------- failure band
@@ -165,12 +203,38 @@
     transform: translateX(-50%);
   }
 }
+/* a quiet reporter is not activity: when the watchdog reports no progress,
+   the sweep stops where it stands instead of claiming motion the payload
+   cannot back (the reduced-motion park above wins regardless) */
+.scan-meter.is-stalled .scan-meter-fill {
+  animation-play-state: paused;
+}
 /* the % slot: an honest dash — it exists so a total, if the engine ever
    ships one, has a home at the meter's right end */
 .scan-pct {
   flex: none;
   font-size: 13px;
   color: var(--ink-2);
+}
+
+/* --------------------------------------------------- figure slots
+   A figure that has a unit riding after it reserves its longest honest
+   width (ch = one digit of the tabular mono), so the unit sits at the same
+   x on every tick instead of sliding right as digits grow. Right-aligned:
+   the number hugs its unit and grows leftward, into empty space. */
+
+.slot {
+  display: inline-block;
+  text-align: right;
+}
+.scan-hero .stat-v .slot {
+  min-width: 4ch; /* splitBytes num never exceeds 4 chars ("1.50"/"1024") */
+}
+.scan-kpi .stat-v .slot {
+  min-width: 7ch; /* "999.9" .. "999,999" before the format changes scale */
+}
+.scan-peak .slot {
+  min-width: 7ch;
 }
 
 /* --------------------------------------------------- counters band */
@@ -232,7 +296,7 @@
 .scan-peak-u {
   font-size: 10.5px;
   font-weight: 500;
-  color: var(--ink-3);
+  color: var(--ink-2);
 }
 
 /* the strip: the bed hugs exactly the sample slots it plots (90 × (4px bar +
@@ -261,6 +325,21 @@
   background: color-mix(in srgb, var(--ink) 55%, transparent);
 }
 
+/* --------------------------------------------------- quiet status band
+   Edge states as plain words: nothing reported yet, entries the walk could
+   not read, reports gone quiet. Facts only — failure belongs to the danger
+   band above, and this line is never an overlay. One clipped line, so it can
+   never push the walking foot around when a count ticks over. */
+
+.scan-status {
+  margin: 0; /* no UA paragraph margin — bands butt edge-to-edge, always */
+  padding: 10px 20px 11px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* --------------------------------------------------- walking foot */
 
 .scan-foot {
@@ -273,17 +352,17 @@
 .scan-foot .micro {
   flex: none;
 }
-/* head-clipped ellipsis: rtl keeps the tail (the entry under the walker)
-   visible when clipped; the title attribute carries the path in full */
+/* middle-truncated to a fixed budget upstream (ellipsizePath keeps root +
+   leaf), with the ellipsis only as a last resort at extreme widths — one
+   line, never a rewrap; the title attribute carries the path in full.
+   ink-2, not ink-3: at 10.5px ink-3 misses AA in both themes */
 .scan-path {
   font-size: 10.5px;
-  color: var(--ink-3);
+  color: var(--ink-2);
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  direction: rtl;
-  text-align: left;
 }
 
 /* ------------------------------------------------------------ responsive */
@@ -306,6 +385,9 @@
   }
   .scan-rate {
     padding: 12px 16px 14px;
+  }
+  .scan-status {
+    padding: 9px 16px 10px;
   }
   .scan-foot {
     padding: 10px 16px 12px;

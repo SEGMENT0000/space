@@ -52,7 +52,7 @@ import {
   openWithSystem,
   revealInExplorer,
 } from "../lib/ipc";
-import { clearPreviews, loadPreview } from "../lib/preview";
+import { invalidatePreviews, requestPreview, setPreviewGeneration } from "../lib/preview";
 import type { HoverInfo, TreemapHandle } from "../lib/treemap/types";
 import type {
   ChildEntry,
@@ -62,10 +62,65 @@ import type {
 } from "../lib/types";
 import { ExplorerRail, type RailDetail, type RailSelection } from "./ExplorerRail";
 import { TreemapCanvas } from "./treemap/TreemapCanvas";
-import { HoverCard, IconBtn, Segmented } from "./ui";
+import { HoverCard, IconButton, KeyHint, SegmentedControl, useShell } from "./ui";
 import type { HoverCardData } from "./ui";
 
 export type SortMode = "size" | "name" | "type";
+
+/** Folder cards draw from the LIVE SCAN INDEX, not a fresh disk read: the
+ *  scanner already knows every child's subtree size, so a folder card can
+ *  answer the only question that matters on a huge leaf folder ("where are
+ *  the bytes?") with real sizes on both file and directory rows. The preview
+ *  backend's folder listing is the fallback for paths outside the scan; it
+ *  can only report immediate names and no directory sizes.
+ *
+ *  Single-child descent: a leaf folder that wraps exactly one directory
+ *  (Chrome → User Data) would otherwise spend a 600px card on one row. We
+ *  descend up to FOLDER_CARD_CHAIN wrapper levels and render the first level
+ *  with more than one child, noting the chain in the head meta ("via User
+ *  Data"). Bounded: at most four in-memory child queries, all cached by
+ *  getChildren. */
+const FOLDER_CARD_ROWS = 32;
+const FOLDER_CARD_CHAIN = 4;
+
+async function loadFolderCard(entryId: number): Promise<PreviewPayload | null> {
+  try {
+    let nodeId = entryId;
+    const via: string[] = [];
+    for (let step = 0; ; step++) {
+      const res = await getChildren(nodeId, 1, "size", FOLDER_CARD_ROWS);
+      const entries = res.entries;
+      // A wrapper, not content: exactly one child, a directory, and the
+      // parent's own count confirms nothing else was hidden.
+      if (
+        step < FOLDER_CARD_CHAIN &&
+        entries.length === 1 &&
+        entries[0].isDir &&
+        res.totalEntries === 1
+      ) {
+        via.push(entries[0].name);
+        nodeId = entries[0].id;
+        continue;
+      }
+      return {
+        family: "list",
+        list: {
+          kind: "folder",
+          entries: entries.map((e) => ({
+            name: e.name,
+            size: e.size,
+            kind: e.isDir ? "dir" : "file",
+          })),
+          truncated: res.totalEntries > entries.length,
+          total: res.totalEntries,
+          ...(via.length > 0 ? { via } : {}),
+        },
+      };
+    }
+  } catch {
+    return null; // honest fallback card; the scan may be torn down
+  }
+}
 
 export interface FileApi {
   reveal(path: string): Promise<void>;
@@ -91,6 +146,12 @@ export interface ExplorerControl {
 // flag keeps a later remount from re-teaching what is already recorded.
 const HINT_KEY = "space.hint.shown";
 let hintRecorded = false;
+
+// Preview/view epochs are module-global: preview.ts keys staleness by
+// generation equality, so a remounting view must never re-use a number an
+// earlier instance already stamped on an in-flight fetch — otherwise that
+// stale response would look current again and cache under a dead dataset.
+let viewEpoch = 0;
 
 type HintPhase = "shown" | "fading" | "gone";
 
@@ -156,18 +217,48 @@ export function ExplorerView({
     }
   });
 
-  // Nav generation token (FLEET §D cancellation): there is no abort in Tauri
-  // invoke, so every async flow captures the epoch at dispatch and drops its
-  // result when a newer navigation has bumped the ref. Bumped at the top of
-  // load() and on unmount.
+  // View/preview generation (FLEET §D cancellation): there is no abort in
+  // Tauri invoke, so every preview flow captures the epoch at dispatch and
+  // drops its delivery when a newer one has moved on. Bumped on every
+  // load()/drill and on every filter change, mirrored into the preview
+  // pipeline through setPreviewGeneration (cache kept — entry ids are stable
+  // within a scan), and always raised from the module counter above so the
+  // number is unique across mounts.
   const genRef = useRef(0);
 
-  // entryId → PreviewPayload for the plate layer (FLEET §D/G). React state
+  // The load token is deliberately SEPARATE from the preview generation: a
+  // filter keystroke bumps the preview epoch too, and that must never cancel
+  // a folder read that is mid-flight. Bumped only at the top of load() and
+  // on unmount; every getChildren/getCategoryTotals result checks it.
+  const navGenRef = useRef(0);
+
+  // entryId → payload for the plate layer (FLEET §D/G). React state
   // (not a bare ref) so each arrival re-renders TreemapCanvas with a fresh
   // ReadonlyMap — the renderer reads payloads by entryId and must see them
-  // land. Entry ids are stable within a scan, so the map survives nav
-  // (back/forward re-plates instantly from memory).
-  const [previews, setPreviews] = useState<ReadonlyMap<number, PreviewPayload>>(new Map());
+  // land. `null` is stored too: it is the pipeline's honest "unreadable",
+  // and the plate layer draws its fallback card for it instead of leaving an
+  // endless spinner. Entry ids are stable within a scan, so the map survives
+  // nav (back/forward re-plates instantly from memory) and is rebuilt only
+  // on a genuine reload (the mount below).
+  const [previews, setPreviews] = useState<ReadonlyMap<number, PreviewPayload | null>>(new Map());
+
+  // Lazy recursive interiors (entryId → that folder's children). The renderer
+  // asks for a folder's next level through onNeedExpand; each arrival is
+  // batched with its neighbours and published as ONE new Map (~48ms), so a
+  // burst of expansions costs one render/rebuild, not one per folder.
+  // Entry ids are stable within a scan and getChildren is LRU-cached, so this
+  // survives drill navigation; a new scan remounts the view, starting empty.
+  const [expanded, setExpanded] = useState<ReadonlyMap<number, ChildEntry[]>>(() => new Map());
+  // Latest settled map, readable synchronously by the stable onNeedExpand
+  // callback (depending on `expanded` itself would mint a new callback per
+  // batch). Mirrors the render-assigned pathOfResp ref above.
+  const expandedRef = useRef<ReadonlyMap<number, ChildEntry[]>>(expanded);
+  expandedRef.current = expanded;
+  // In-flight dedupe per folder, plus one shared accumulation batch and its
+  // single flush timer.
+  const expandPending = useRef<Set<number>>(new Set());
+  const expandBatch = useRef<Map<number, ChildEntry[]>>(new Map());
+  const expandTimer = useRef(0);
 
   // navigation history over node ids
   const historyRef = useRef<{ ids: number[]; names: string[]; idx: number }>({
@@ -180,13 +271,27 @@ export function ExplorerView({
   const pathOfResp = useRef(rootPath);
   pathOfResp.current = resp?.path ?? rootPath;
 
+  // One bump for the view/preview epoch: raises the module counter (never
+  // recycling an epoch an earlier mount already stamped), mirrors it into
+  // the preview pipeline so queued/in-flight work for the old view resolves
+  // null instead of landing late, and arms this view's delivery guard.
+  const bumpViewGen = useCallback(() => {
+    const gen = ++viewEpoch;
+    genRef.current = gen;
+    setPreviewGeneration(gen);
+    return gen;
+  }, []);
+
   // ------------------------------------------------------------ loading
 
   const load = useCallback(
     (nodeId: number, name: string, mode: "push" | "replace") => {
       // Generation capture: every load (double-click, goUp, back/forward,
-      // breadcrumb, initial mount) invalidates all older in-flight loads.
-      const gen = ++genRef.current;
+      // breadcrumb, initial mount) invalidates all older in-flight loads
+      // (nav token) and moves the preview pipeline to the new view (preview
+      // epoch — cache stays warm, back/forward re-plates instantly).
+      bumpViewGen();
+      const nav = ++navGenRef.current;
       // Zero-stale hover begins here: the moment a navigation starts the
       // card folds (the renderer re-resolves on the next real move over the
       // NEW frame — never against the old one).
@@ -196,7 +301,7 @@ export function ExplorerView({
         .then((r) => {
           // Stale-drop: a newer navigation started while this request was in
           // flight — its result describes a view the user has already left.
-          if (genRef.current !== gen) return;
+          if (navGenRef.current !== nav) return;
           setResp(r);
           setLoadErr(null);
           setCurrentName(name);
@@ -221,24 +326,24 @@ export function ExplorerView({
           // rejection here must never be a silent unhandled one.
           void getCategoryTotals(nodeId)
             .then((cats) => {
-              if (genRef.current !== gen) return;
+              if (navGenRef.current !== nav) return;
               setCategories(cats);
             })
             .catch((err) => {
-              if (genRef.current !== gen) return;
+              if (navGenRef.current !== nav) return;
               console.error("space: category totals failed", nodeId, err);
             });
         })
         .catch((err) => {
           // A failed read is a state of the panel, not a dead screen: show
           // the honest bed with the real reason (still logged for dev).
-          if (genRef.current !== gen) return;
+          if (navGenRef.current !== nav) return;
           console.error("space: getChildren failed", nodeId, err);
           setLoadErr(err instanceof Error ? err.message : String(err));
           setResp(null);
         });
     },
-    [],
+    [bumpViewGen],
   );
   // ------------------------------------------------------------ hover
 
@@ -266,6 +371,121 @@ export function ExplorerView({
     el.style.top = `${Math.round(Math.max(8, Math.min(top, hh - h - 8)))}px`;
   }, []);
 
+  // Renderer → explorer folder-interior request. Reads exactly ONE level
+  // (depth 1: the payload is just that folder's children, with no attached
+  // sub-samples), dedupes in flight per entryId, and coalesces every settle
+  // inside a ~48ms window into a single setExpanded — one render/rebuild per
+  // batch. The view generation is captured BEFORE the async hop; a result
+  // delivered after a drill/filter move is dropped. A failed read is stored
+  // as [] (an honest "asked, no children to draw") so the renderer stops
+  // asking instead of retrying forever.
+  const onNeedExpand = useCallback((entryId: number) => {
+    if (
+      expandedRef.current.has(entryId) ||
+      expandPending.current.has(entryId) ||
+      expandBatch.current.has(entryId)
+    ) {
+      return;
+    }
+    expandPending.current.add(entryId);
+    const gen = genRef.current;
+    // Stage one settled folder and arm the shared flush on first arrival.
+    const queue = (kids: ChildEntry[]) => {
+      if (genRef.current !== gen) return;
+      expandBatch.current.set(entryId, kids);
+      if (expandTimer.current !== 0) return;
+      expandTimer.current = window.setTimeout(() => {
+        expandTimer.current = 0;
+        const batch = expandBatch.current;
+        expandBatch.current = new Map();
+        if (batch.size === 0) return;
+        setExpanded((prev) => {
+          const next = new Map(prev);
+          for (const [k, v] of batch) next.set(k, v);
+          return next;
+        });
+      }, 48);
+    };
+    void getChildren(entryId, 1, "size", 900)
+      .then((r) => queue(r.entries))
+      .catch((err) => {
+        // Unreadable folder: remember the empty answer, never throw.
+        console.error("space: getChildren expand failed", entryId, err);
+        queue([]);
+      })
+      .finally(() => {
+        expandPending.current.delete(entryId);
+      });
+  }, []);
+
+  // entryId → entry + path in the CURRENT view. The renderer is path-dumb:
+  // the hover card, context menu, actions and preview requests all resolve
+  // through here. Walks descendants at ANY depth (the payload's depth-1 `sub`
+  // plus every lazily expanded folder), joining paths level by level, so deep
+  // tiles resolve exactly like direct children. Lookups stay O(1); the depth
+  // cap and visited guard make a malformed cycle terminate.
+  const entryIndex = useMemo(() => {
+    const m = new Map<number, { e: ChildEntry; path: string; depth: number }>();
+    const base = pathOfResp.current;
+    const walk = (list: readonly ChildEntry[], parentPath: string, depth: number) => {
+      if (depth > 8) return;
+      for (const e of list) {
+        if (m.has(e.id)) continue;
+        const path = joinPath(parentPath, e.name);
+        m.set(e.id, { e, path, depth });
+        const kids = expanded.get(e.id) ?? e.sub;
+        if (kids && kids.length > 0) walk(kids, path, depth + 1);
+      }
+    };
+    walk(resp?.entries ?? [], base, 0);
+    return m;
+  }, [resp, expanded]);
+
+  const findEntry = useCallback(
+    (id: number): { e: ChildEntry; path: string; depth: number } | null => entryIndex.get(id) ?? null,
+    [entryIndex],
+  );
+
+  // Renderer → explorer preview request (FLEET §D/G), fired two ways: by the
+  // treemap when a tile crosses its size gate, and by every hover identity
+  // change below (the tile under the cursor always gets content, whatever
+  // the zoom). The fixed signature is (entryId, path) — the path arrives
+  // when the renderer carries one, and this view resolves it otherwise (it
+  // is the only layer that knows paths). The view generation is captured
+  // BEFORE the async hop: a delivery for a view the user has left is
+  // dropped, never stored. `null` is stored as-is — the pipeline's honest
+  // "unreadable" — so the plate layer draws its fallback card instead of
+  // waiting forever.
+  const onNeedPreview = useCallback(
+    (entryId: number, path?: string) => {
+      const gen = genRef.current;
+      const info = findEntry(entryId);
+      const resolved = path || info?.path;
+      if (!resolved) return; // not in the current view — nothing honest to fetch
+      // Leaf folder → a folder card from the scan index, with real subtree
+      // sizes and a wrapper-chain descent. Interior folders never reach this
+      // branch (the renderer only asks for directories with no child rect).
+      if (info?.e.isDir) {
+        void loadFolderCard(entryId).then((payload) => {
+          if (genRef.current !== gen) return; // a navigation moved on
+          setPreviews((prev) =>
+            prev.get(entryId) === payload ? prev : new Map(prev).set(entryId, payload),
+          );
+        });
+        return;
+      }
+      requestPreview(entryId, resolved, (id, payload) => {
+        if (genRef.current !== gen) return; // a navigation moved on
+        // Identity-guarded: a cached payload re-delivering itself must not
+        // re-render the map. Otherwise a fresh Map instance → the
+        // ReadonlyMap prop identity changes and TreemapCanvas re-renders
+        // with the payload (or the honest null) present.
+        setPreviews((prev) => (prev.get(id) === payload ? prev : new Map(prev).set(id, payload)));
+      });
+    },
+    [findEntry],
+  );
+
   // The ONE hover write path. Payload = always the item under the pointer.
   const onHoverChange = useCallback(
     (info: HoverInfo | null) => {
@@ -285,8 +505,16 @@ export function ExplorerView({
       hoverIdRef.current = info.entryId;
       positionCard(info.x, info.y);
       setHover(info);
+      // Warm the hovered tile's preview regardless of zoom. Directories never
+      // plate (a folder's interior is the nested treemap), but file tiles at
+      // ANY depth can now plate: lazy expansion puts deep folders on the map,
+      // so resolve the path and ask for every non-directory the index knows.
+      if (!info.isDir) {
+        const f = findEntry(info.entryId);
+        if (f) onNeedPreview(info.entryId, f.path);
+      }
     },
-    [positionCard],
+    [positionCard, findEntry, onNeedPreview],
   );
 
   // After any render with a live hover, glue the card to the freshest
@@ -298,24 +526,47 @@ export function ExplorerView({
   });
 
   useEffect(() => {
+    // A genuine reload, and the ONLY place the preview pipeline is
+    // invalidated: App renders ExplorerView per screen, so a mount is the
+    // moment a new scan's dataset arrives (and a drives round-trip is at
+    // worst a harmless refetch). The pipeline cache is keyed by entryId and
+    // can outlive the data it describes — dropping it here means drills
+    // never pay for it: they only move the generation and keep back/forward
+    // instant.
+    invalidatePreviews();
+    setPreviews(new Map());
     load(rootId, leafName(rootPath), "replace");
     void getLargestFiles(30)
       .then(setLargest)
       .catch((err) => console.error("space: largest files failed", err));
     return () => {
-      // Unmount governs preview cleanup: App renders ExplorerView
-      // conditionally per screen ({screen === "explorer"}), so a rescan /
-      // drives round-trip unmounts this view and remounts it fresh — the
-      // unmount clear IS the "new scan data" clear. Bumping the generation
-      // too makes any still-in-flight load/preview drop instead of calling
-      // setState on an unmounted tree.
-      genRef.current += 1;
+      // Unmount: bump both tokens so any still-in-flight load/preview
+      // delivery lands on a dead view and drops instead of calling setState
+      // on an unmounted tree. The cache itself belongs to the NEXT mount's
+      // reload above — no clearPreviews-on-unmount pattern here.
+      genRef.current = ++viewEpoch;
+      navGenRef.current += 1;
       window.clearTimeout(toastTimer.current);
-      clearPreviews();
+      // Expansion pipeline dies with the view: no queued folder result or
+      // pending batch may flush into an unmounted tree.
+      expandPending.current.clear();
+      expandBatch.current.clear();
+      window.clearTimeout(expandTimer.current);
+      expandTimer.current = 0;
       onReady(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // A filter change reshapes what the renderer qualifies (dimmed tiles stop
+  // asking, newly-matching ones start), so it moves the preview generation
+  // exactly like a drill does: queued/in-flight results for the old shape
+  // resolve null instead of landing late, and the pipeline's failed set gets
+  // a fresh retry budget. It touches ONLY the preview epoch — the nav token
+  // above keeps a keystroke from cancelling a folder read in flight.
+  useEffect(() => {
+    bumpViewGen();
+  }, [bumpViewGen, query]);
 
   // ------------------------------------------------------------ derived
 
@@ -340,28 +591,34 @@ export function ExplorerView({
     const q = query.trim().toLowerCase();
     if (!q) return null;
     const set = new Set<number>();
-    for (const e of sorted) {
-      if (e.name.toLowerCase().includes(q)) set.add(e.id);
-      if (e.sub) for (const s of e.sub) if (s.name.toLowerCase().includes(q)) set.add(s.id);
-    }
+    // Mirror entryIndex: match at every depth the map can draw, preferring a
+    // lazily expanded folder's fetched children over the payload's `sub`.
+    // Depth cap + visited guard keep a malformed cycle finite.
+    const seen = new Set<number>();
+    const walk = (list: readonly ChildEntry[], depth: number) => {
+      if (depth > 8) return;
+      for (const e of list) {
+        if (seen.has(e.id)) continue;
+        seen.add(e.id);
+        if (e.name.toLowerCase().includes(q)) set.add(e.id);
+        const kids = expanded.get(e.id) ?? e.sub;
+        if (kids && kids.length > 0) walk(kids, depth + 1);
+      }
+    };
+    walk(sorted, 0);
     return set;
-  }, [query, sorted]);
+  }, [query, sorted, expanded]);
 
   const matches = highlightIds?.size ?? 0;
 
   // selection -> rail detail
   const selection: RailSelection | null = useMemo(() => {
     if (selIds.length === 0) return null;
-    const all = new Map<number, { e: ChildEntry; parent: string }>();
-    const base = pathOfResp.current;
-    for (const e of sorted) {
-      all.set(e.id, { e, parent: base });
-      if (e.sub) for (const s of e.sub) all.set(s.id, { e: s, parent: joinPath(base, e.name) });
-    }
-    const primary = all.get(selIds[selIds.length - 1]);
+    // Deep tiles are selectable now that interiors expand recursively, so the
+    // primary resolves through the same any-depth index as hover/actions.
+    const primary = findEntry(selIds[selIds.length - 1]);
     let detail: RailDetail | null = null;
     if (primary) {
-      const path = primary.e.id === resp?.parentId ? base : joinPath(primary.parent, primary.e.name);
       detail = {
         id: primary.e.id,
         name: primary.e.name,
@@ -370,11 +627,11 @@ export function ExplorerView({
         cat: primary.e.cat,
         fileCount: primary.e.fileCount,
         kidCount: primary.e.kidCount,
-        path,
+        path: primary.path,
       };
     }
     return { ids: selIds, total: selTotal, detail };
-  }, [selIds, selTotal, sorted, resp]);
+  }, [selIds, selTotal, findEntry]);
 
   // Rail bounds the memo: rebuilt only when the folder or its size moves.
   const railCurrent = useMemo(
@@ -387,51 +644,8 @@ export function ExplorerView({
     [currentName, resp, rootPath],
   );
   // ------------------------------------------------------------ actions
-
-  const findEntry = useCallback(
-    (id: number): { e: ChildEntry; path: string } | null => {
-      for (const e of sorted) {
-        if (e.id === id) return { e, path: joinPath(pathOfResp.current, e.name) };
-        if (e.sub) for (const s of e.sub) if (s.id === id) return { e: s, path: joinPath(joinPath(pathOfResp.current, e.name), s.name) };
-      }
-      return null;
-    },
-    [sorted],
-  );
-
-  // Renderer → explorer preview request (FLEET §D/G): the treemap is
-  // path-dumb — it asks by entryId, and only this component resolves paths.
-  const onNeedPreview = useCallback(
-    (entryId: number) => {
-      // Capture the nav generation BEFORE the async hop: if the user
-      // navigates while the preview is in flight, the payload describes a
-      // view they've left — drop it. The renderer retries on the next
-      // qualifying frame for whatever is on screen then.
-      const gen = genRef.current;
-      // Same path derivation the hover card and context menu use.
-      const f = findEntry(entryId);
-      if (!f) return; // not in the current view — nothing honest to fetch
-      // loadPreview dedupes in-flight requests and resolves null on any
-      // error (never throws): null → do nothing, the renderer draws its
-      // honest fallback plate.
-      void loadPreview(entryId, f.path)
-        .then((p) => {
-          if (!p) return;
-          if (genRef.current !== gen) return; // stale: nav moved on
-          // New Map instance → the ReadonlyMap prop identity changes and
-          // TreemapCanvas re-renders with the payload present.
-          setPreviews((prev) => {
-            const next = new Map(prev);
-            next.set(entryId, p);
-            return next;
-          });
-        })
-        // loadPreview never rejects by contract; belt-and-braces so a
-        // contract regression can't surface as an unhandled rejection.
-        .catch((err) => console.error("space: preview load failed", entryId, err));
-    },
-    [findEntry],
-  );
+  // (identity → entry/path resolves through findEntry above, in the hover
+  // section: one index, shared by the card, the menu and every action.)
 
   // ------------------------------------------------------------ toasts
 
@@ -653,15 +867,21 @@ export function ExplorerView({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const inInput = e.target instanceof HTMLInputElement;
+      // Gate on THIS view's filter input identity — not merely "some input
+      // is focused". The global palette input (owned by App) and the rail's
+      // filter are other elements' business: Esc there must close/act on
+      // their own terms and never wipe the explorer query.
+      const inFilter = inInput && e.target === searchRef.current;
       if (e.key === "Escape") {
         setMenu(null);
-        if (inInput) {
+        if (inFilter) {
           // The filter box owns Esc: clear the query and release focus —
           // blur alone left the dimmed filtered map stranded behind a
           // focused-looking field.
           clearQuery();
-          (e.target as HTMLInputElement).blur();
-        } else {
+          searchRef.current?.blur();
+        } else if (!inInput) {
+          // Anywhere outside an input: Esc clears the selection.
           setSelIds([]);
           setSelTotal(0);
           mapRef.current?.clearSelection();
@@ -800,10 +1020,19 @@ export function ExplorerView({
               theme={theme}
               hiddenCats={hiddenCats}
               highlightIds={highlightIds}
-              // FLEET §G cross-file contract: previews land with the renderer
-              // agent in this wave. Runtime-safe today (React drops unknown
-              // props on a DOM-less component); tsc completes at integration.
-              previews={previews}
+              // FLEET §G cross-file contract: payloads land in the pooled
+              // plate layer by entryId. A stored `null` is the pipeline's
+              // honest failure — the renderer shows its fallback card for
+              // it. (The canvas's prop type still reads
+              // ReadonlyMap<number, PreviewPayload> while the contract is
+              // `payload | null`; the cast tracks the contract — drop it
+              // when that type widens.)
+              previews={previews as ReadonlyMap<number, PreviewPayload>}
+              // Lazy recursive interiors: settled children by folder entryId,
+              // and the stable request callback the renderer fires when a
+              // folder's interior is large enough to draw but not yet known.
+              expanded={expanded}
+              onNeedExpand={onNeedExpand}
               onNeedPreview={onNeedPreview}
               onZoomCommit={onZoomCommit}
               onOpenFile={doOpen}
@@ -887,6 +1116,13 @@ export function ExplorerView({
               selectedId={selIds.length === 1 ? selIds[0] : null}
               currentId={resp?.parentId ?? -1}
               theme={theme}
+              // Rail's optional readout states, fed from the map panel's own
+              // state: no response yet → dashed hero + skeletons; a failed
+              // read → the engine's verbatim message in the readout cell.
+              // Both optional upstream, so a frame where neither applies
+              // renders the rail data-ready, never blank.
+              loading={mapState === "loading"}
+              error={mapState === "error" ? loadErr : null}
             />
           </div>
         )}
@@ -950,12 +1186,12 @@ const Topbar = memo(function Topbar({
   return (
     <header className="topbar">
       <div className="nav-pair">
-        <IconBtn title="Back" disabled={backDisabled} onClick={onBack}>
+        <IconButton label="Back" disabled={backDisabled} onClick={onBack}>
           <ChevronLeft size={16} />
-        </IconBtn>
-        <IconBtn title="Forward" disabled={fwdDisabled} onClick={onForward}>
+        </IconButton>
+        <IconButton label="Forward" disabled={fwdDisabled} onClick={onForward}>
           <ChevronRight size={16} />
-        </IconBtn>
+        </IconButton>
       </div>
 
       <nav className="crumbs" aria-label="Folder path">
@@ -989,13 +1225,14 @@ const Topbar = memo(function Topbar({
           spellCheck={false}
         />
         {query && (
-          <IconBtn title="Clear" onClick={onClearQuery}>
+          <IconButton label="Clear" onClick={onClearQuery}>
             <X size={12} />
-          </IconBtn>
+          </IconButton>
         )}
       </div>
 
-      <Segmented<SortMode>
+      <SegmentedControl<SortMode>
+        label="Sort by"
         options={[
           { id: "size", label: "Size" },
           { id: "name", label: "Name" },
@@ -1006,12 +1243,12 @@ const Topbar = memo(function Topbar({
       />
 
       <button type="button" className="pal-hint" aria-label="Command palette (Ctrl K)" onClick={onPalette}>
-        <span className="kbd">Ctrl K</span>
+        <KeyHint keys="Ctrl K" />
       </button>
 
-      <IconBtn title="Toggle inspector" active={railOpen} onClick={onRail}>
+      <IconButton label="Toggle inspector" active={railOpen} onClick={onRail}>
         <PanelRight size={15} />
-      </IconBtn>
+      </IconButton>
     </header>
   );
 });
@@ -1029,7 +1266,10 @@ interface StatusbarProps {
   theme: "light" | "dark";
   onRescan(): void;
   onDrives(): void;
-  onTheme(): void;
+  /** App's theme callback (the view's prop contract). The shell API below is
+      the fallback when it is absent — they are one function in practice:
+      App builds ShellContext from this very callback. */
+  onTheme?: () => void;
   /** Chip action: the hidden-count readout is also the switch — clicking it
       unhides every filtered category at once. */
   onUnhideAll(): void;
@@ -1047,6 +1287,8 @@ const Statusbar = memo(function Statusbar({
   onTheme,
   onUnhideAll,
 }: StatusbarProps) {
+  // The shell's theme switch (toggleTheme) — the fallback path above.
+  const { toggleTheme } = useShell();
   return (
     <footer className="statusbar">
       <div className="sb-readouts">
@@ -1082,7 +1324,7 @@ const Statusbar = memo(function Statusbar({
         <button type="button" className="status-btn" onClick={onDrives}>
           Drives
         </button>
-        <button type="button" className="status-btn" onClick={onTheme}>
+        <button type="button" className="status-btn" onClick={onTheme ?? toggleTheme}>
           {theme === "dark" ? "Light" : "Dark"}
         </button>
       </div>

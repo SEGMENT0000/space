@@ -2,8 +2,14 @@
 //!
 //! One command, one payload: the module sniffs dir-vs-file and the preview
 //! family itself, enforces every size cap BEFORE decoding, and caches results
-//! in a managed LRU keyed `(path, mtime, len)`. Errors are lowercase and
-//! specific (`"not found"`, `"unsupported"`, `"unreadable: <reason>"`).
+//! in a managed LRU keyed `(path, mtime, len)`. A fallback ladder (richest
+//! family → text head → hex head → magic/signature card) keeps every readable
+//! regular file on a REAL card, and every rejection but an absent path
+//! degrades to a magic card carrying the reason verbatim — `Err` survives
+//! only for an empty path or "not found". Errors are lowercase and specific
+//! (`"not found"`, `"access denied"`, `"file in use"`) — the note row is
+//! already the card's failed-read line, so short reasons beat a repeated
+//! `unreadable:` prefix that clips inside a narrow card.
 
 use std::fs::{self, File};
 use std::future::Future;
@@ -21,16 +27,19 @@ use crate::model::{
 
 // --- Family caps (FLEET_SPEC §A/§B). Enforced BEFORE any decode. ---
 const TEXT_CAP: u64 = 64 * 1024; // TEXT/SVG head read
-const TEXT_LINES: usize = 200; // returned line cap
+const TEXT_LINES: usize = 120; // returned line cap
 const HEX_CAP: u64 = 4 * 1024; // hexdump head
 const LIST_CAP: usize = 200; // list entry cap (folders, archives, tar, sheets)
 const DIR_HEAD: usize = 1024; // folder entries that get metadata (size sort head)
 const DIR_COUNT_MAX: u64 = 50_000; // exact folder totals stop being "cheap" here
 const IMAGE_BYTES_CAP: u64 = 32 * 1024 * 1024; // decode input cap (oversize → meta)
 const IMAGE_MP: u64 = 8_000_000; // 8 megapixel decode cap
-const IMAGE_EDGE: u32 = 256; // thumbnail longest edge
+const IMAGE_EDGE: u32 = 512; // thumbnail longest edge
 const IMAGE_JPEG_Q: u8 = 80; // thumbnail quality
 const DB_TABLES_CAP: usize = 100; // table list cap (never COUNT(*))
+const DB_ROWS_TABLES: usize = 3; // leading tables that get sampled rows
+const DB_ROWS: usize = 5; // sampled rows per table (bounded LIMIT)
+const DB_CELL: usize = 64; // display chars per sampled cell
 const META_HEAD: u64 = 64 * 1024; // signature/parser head read
 const PDF_SCAN: u64 = 1024 * 1024; // bounded page-count scan for PDFs
 const TABLE_READ_CAP: u64 = 16 * 1024; // targeted table reads (fonts, PE/ELF tails)
@@ -178,18 +187,43 @@ fn acquire(sem: &Arc<Semaphore>) -> PermitFuture {
 
 /// Content preview for a file OR folder — sniffs dir-vs-file and the family
 /// internally. Heavy work runs under the ≤4-permit gate on the async runtime.
+///
+/// Rejection policy: `Err` ONLY for an empty path or a genuinely absent file
+/// ("not found"). Every other failure — symlink, non-regular, ACL-denied,
+/// exclusively locked, vanished mid-read — degrades to a magic card carrying
+/// the reason verbatim in its `note` pair, so a tile for a file that exists
+/// never renders as "no preview".
 pub async fn get_preview(state: &PreviewState, path: String) -> Result<PreviewPayload, String> {
     if path.is_empty() {
         return Err("not found".to_string());
     }
-    // Safety (§B): reject symlinks up front (the walker's skip rule — we never
-    // follow a symlink target), then canonicalize for a stable identity.
-    let pre = fs::symlink_metadata(&path).map_err(io_err)?;
+    // Safety (§B): identify symlinks up front (the walker's skip rule — we
+    // never follow a symlink target), then canonicalize for a stable identity.
+    let pre = match fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("not found".to_string());
+        }
+        Err(e) => return Ok(degraded_meta(Path::new(&path), &io_err(e), false)),
+    };
     if pre.file_type().is_symlink() {
-        return Err("unsupported".to_string());
+        // Never read through a link — the link's own stat, no signature.
+        return Ok(degraded_meta(Path::new(&path), "symlink", false));
     }
-    let canon = fs::canonicalize(&path).map_err(io_err)?;
-    let meta = fs::metadata(&canon).map_err(io_err)?;
+    let canon = match fs::canonicalize(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("not found".to_string());
+        }
+        Err(e) => return Ok(degraded_meta(Path::new(&path), &io_err(e), false)),
+    };
+    let meta = match fs::metadata(&canon) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("not found".to_string());
+        }
+        Err(e) => return Ok(degraded_meta(&canon, &io_err(e), false)),
+    };
     let key = CacheKey {
         path: canon.to_string_lossy().into_owned(),
         mtime_ms: mtime_ms(&meta),
@@ -207,24 +241,92 @@ pub async fn get_preview(state: &PreviewState, path: String) -> Result<PreviewPa
         return Ok(payload);
     }
 
+    // Degraded cards are deliberately NOT cached: they describe a transient
+    // access state, and their (mtime, len) key may be unknown anyway.
     let payload = if meta.is_dir() {
-        build_dir_list(&canon, &meta)?
+        match build_dir_list(&canon, &meta) {
+            Ok(p) => p,
+            Err(e) if e == "not found" => return Err(e),
+            Err(e) => return Ok(degraded_meta(&canon, &e, false)),
+        }
     } else if meta.is_file() {
-        build_file(&canon, &meta)?
+        match build_file(&canon, &meta) {
+            Ok(p) => p,
+            Err(e) if e == "not found" => return Err(e),
+            Err(e) => return Ok(degraded_meta(&canon, &e, false)),
+        }
     } else {
-        // Sockets/pipes/devices — non-regular, rejected per §B.
-        return Err("unsupported".to_string());
+        // Sockets/pipes/devices — non-regular: never followed, never read.
+        return Ok(degraded_meta(&canon, "unsupported", false));
     };
 
     lock_sem(&state.cache).insert(key, payload.clone());
     Ok(payload)
 }
 
+/// Best-effort magic card for a path that cannot be fully previewed. Every
+/// pair is real: signature bytes only when reading is proven safe (`follow` —
+/// never through a link), mtime/size when stat-able — plus the rejection
+/// reason verbatim in `note`. Nothing unknown is ever printed.
+fn degraded_meta(path: &Path, reason: &str, follow: bool) -> PreviewPayload {
+    let stat = if follow {
+        fs::metadata(path).ok()
+    } else {
+        fs::symlink_metadata(path).ok()
+    };
+    // A directory's file-extension says nothing about its contents, and a
+    // directory's own byte size is not its content size — both suppressed.
+    let (len, modified) = match &stat {
+        Some(m) if !m.is_dir() => (
+            Some(m.len()),
+            m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok()),
+        ),
+        _ => (None, None),
+    };
+    let ext = if stat.as_ref().is_some_and(|m| m.is_dir()) {
+        String::new()
+    } else {
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    let head = if follow {
+        read_head(path, len.unwrap_or(META_HEAD).min(META_HEAD)).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut pairs = vec![pair("note", reason.to_string())];
+    if let Some(name) = sig_format(&head) {
+        pairs.push(pair("format", name));
+    }
+    if let Some(d) = modified {
+        pairs.push(pair("modified", fmt_unix_utc(d.as_secs())));
+    }
+    meta_payload(pairs, &head, len, &ext)
+}
+
 /// Lowercase, specific io messages per the shared error convention.
 fn io_err(e: std::io::Error) -> String {
+    // Windows system files fail with sharing/lock violations, and `io::Error`'s
+    // Display for those is a full OS sentence ("the process cannot access the
+    // file because it is being used by another process. (os error 32)") — it
+    // gets clipped mid-word inside a 260px plate head. The raw code is the only
+    // reliable signal here: ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION both
+    // mean "someone else has it open", which is the honest short genre.
+    #[cfg(windows)]
+    if let Some(code) = e.raw_os_error() {
+        match code {
+            32 | 33 => return "file in use".to_string(),
+            5 => return "access denied".to_string(),
+            _ => {}
+        }
+    }
     match e.kind() {
         std::io::ErrorKind::NotFound => "not found".to_string(),
-        std::io::ErrorKind::PermissionDenied => "unreadable: access denied".to_string(),
+        std::io::ErrorKind::PermissionDenied => "access denied".to_string(),
         _ => unreadable(e),
     }
 }
@@ -355,13 +457,32 @@ fn payload_shell(family: &str) -> PreviewPayload {
     }
 }
 
-fn meta_payload(mut pairs: Vec<MetaPair>, head: &[u8], len: u64) -> PreviewPayload {
-    // §B fallback: nothing parsed → signature hex + size (still real bytes).
-    if pairs.is_empty() && !head.is_empty() {
+/// Magic/signature card (family "meta"): parsed pairs lead, then the honest
+/// extension type label, the raw signature bytes, and the size — `len` is
+/// `None` when the file could not be stat'ed (nothing unknown is printed).
+/// Content detection comes ONLY from bytes; the extension only labels itself.
+fn meta_payload(
+    mut pairs: Vec<MetaPair>,
+    head: &[u8],
+    len: Option<u64>,
+    ext: &str,
+) -> PreviewPayload {
+    let label = ext_class(ext);
+    pairs.push(pair(
+        "type",
+        if ext.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label} (.{ext})")
+        },
+    ));
+    if !head.is_empty() {
         let n = head.len().min(8);
         pairs.push(pair("signature", hex_str(&head[..n])));
     }
-    pairs.push(pair("size", fmt_bytes(len)));
+    if let Some(len) = len {
+        pairs.push(pair("size", fmt_bytes(len)));
+    }
     let mut payload = payload_shell("meta");
     payload.meta = Some(MetaPreview { pairs });
     payload
@@ -508,13 +629,18 @@ fn scrub_svg_line(line: &str, in_script: &mut bool) -> String {
     }
 }
 
-/// Builds the TEXT block. `Ok(None)` means the content is binary — the caller
-/// falls back to HEX instead of rendering garbage.
+/// Reads the TEXT head and decodes it. `Ok(None)` means the content is binary
+/// — the caller falls back to HEX instead of rendering garbage.
 fn build_text(path: &Path, len: u64, is_svg: bool) -> Result<Option<TextPreview>, String> {
-    let read_n = len.min(TEXT_CAP);
-    let raw = read_head(path, read_n)?;
-    let class = match classify_text(&raw) {
-        TextClass::Binary => return Ok(None),
+    let raw = read_head(path, len.min(TEXT_CAP))?;
+    Ok(text_from_head(&raw, len, is_svg))
+}
+
+/// Builds the TEXT block from an already-read head. Shared with the fallback
+/// ladder, which reuses its 64 KB head for the text rung.
+fn text_from_head(raw: &[u8], len: u64, is_svg: bool) -> Option<TextPreview> {
+    let class = match classify_text(raw) {
+        TextClass::Binary => return None,
         c => c,
     };
 
@@ -534,7 +660,7 @@ fn build_text(path: &Path, len: u64, is_svg: bool) -> Result<Option<TextPreview>
         TextClass::Binary => unreachable!(),
     };
 
-    let whole_file = read_n == len; // totalLines only when the read reached EOF
+    let whole_file = raw.len() as u64 == len; // totalLines only when the read reached EOF
     let mut lines: Vec<String> = Vec::new();
     let mut total: u64 = 0;
     let mut in_script = false;
@@ -549,7 +675,7 @@ fn build_text(path: &Path, len: u64, is_svg: bool) -> Result<Option<TextPreview>
         }
     }
     let truncated = lines.len() as u64 != total || !whole_file;
-    Ok(Some(TextPreview {
+    Some(TextPreview {
         lines,
         truncated,
         // §B: best-effort and only when cheap — exact iff the file fit in 64 KB.
@@ -562,7 +688,7 @@ fn build_text(path: &Path, len: u64, is_svg: bool) -> Result<Option<TextPreview>
             }
             .to_string(),
         ),
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +697,12 @@ fn build_text(path: &Path, len: u64, is_svg: bool) -> Result<Option<TextPreview>
 
 fn build_hex(path: &Path, len: u64) -> Result<HexPreview, String> {
     let raw = read_head(path, len.min(HEX_CAP))?;
+    Ok(hex_from_bytes(&raw, len))
+}
+
+/// HEX rows from already-read bytes. Shared with the fallback ladder, which
+/// reuses its 64 KB head when a fresh 4 KB read fails.
+fn hex_from_bytes(raw: &[u8], len: u64) -> HexPreview {
     let mut rows = Vec::with_capacity(raw.len().div_ceil(8));
     for (i, chunk) in raw.chunks(8).enumerate() {
         let mut ascii = String::with_capacity(chunk.len());
@@ -583,17 +715,17 @@ fn build_hex(path: &Path, len: u64) -> Result<HexPreview, String> {
             ascii,
         });
     }
-    Ok(HexPreview {
+    HexPreview {
         rows,
         base: 0,
         total: len,
-    })
+    }
 }
 
-fn hex_payload(path: &Path, len: u64) -> Result<PreviewPayload, String> {
+fn hex_payload(raw: &[u8], len: u64) -> PreviewPayload {
     let mut payload = payload_shell("hex");
-    payload.hex = Some(build_hex(path, len)?);
-    Ok(payload)
+    payload.hex = Some(hex_from_bytes(raw, len));
+    payload
 }
 
 // ---------------------------------------------------------------------------
@@ -607,27 +739,36 @@ fn list_payload(list: ListPreview) -> PreviewPayload {
 }
 
 /// One LIST row with the §A kind tag. Directories carry no size (subtree
-/// sizes need a walk — real or omitted, never fake); kind is always present.
+/// sizes need a walk — real or omitted, never fake); `method` is filled by
+/// archive sources only (tar members are stored uncompressed by definition).
 fn list_entry(name: String, size: Option<u64>, is_dir: bool) -> ListEntry {
     ListEntry {
         name,
         size,
         kind: if is_dir { "dir" } else { "file" }.to_string(),
+        method: None,
     }
 }
 
 /// LIST footer shared by every listing source (folder walk, zip central dir,
 /// sheets, tar walk, ISO PVD): truncates to LIST_CAP and flags truncation
 /// when the collected rows — or a caller-supplied exact count — exceed it.
+/// `kind` names the listing source for the renderer's columns.
 /// WHY no shared sort: folder rows are size-sorted (§A/§G) but archives keep
 /// central-dir/walk order, and reordering archive rows would change the
 /// payload — so ordering deliberately stays per-source.
-fn finish_list(mut entries: Vec<ListEntry>, mut truncated: bool, total: Option<u64>) -> PreviewPayload {
+fn finish_list(
+    mut entries: Vec<ListEntry>,
+    mut truncated: bool,
+    total: Option<u64>,
+    kind: &str,
+) -> PreviewPayload {
     if entries.len() > LIST_CAP {
         truncated = true;
     }
     entries.truncate(LIST_CAP);
     list_payload(ListPreview {
+        kind: Some(kind.to_string()),
         entries,
         truncated,
         total,
@@ -681,6 +822,7 @@ fn build_dir_list(dir: &Path, _meta: &fs::Metadata) -> Result<PreviewPayload, St
         entries,
         truncated,
         if total_known { Some(total) } else { None },
+        "folder",
     ))
 }
 
@@ -688,6 +830,7 @@ fn build_dir_list(dir: &Path, _meta: &fs::Metadata) -> Result<PreviewPayload, St
 // Family routing — §A extension table; content sniff for unknown/no-ext.
 // ---------------------------------------------------------------------------
 
+#[derive(PartialEq, Eq)]
 enum Family {
     Text,
     Hex,
@@ -795,20 +938,56 @@ fn image_payload(i: ImagePreview) -> PreviewPayload {
     payload
 }
 
-fn media_payload(path: &Path, ext: &str) -> PreviewPayload {
+/// MEDIA family: the playable local path PLUS cheaply parsed container facts
+/// (duration/dimensions/codec) — real header bytes only, never a decode.
+/// Every parse is bounded by META_HEAD; anything missing stays `None`.
+fn media_payload(path: &Path, ext: &str, len: u64) -> PreviewPayload {
     let (kind, mime) = if VIDEO_EXTS.contains(&ext) {
         ("video", video_mime(ext))
     } else {
         ("audio", audio_mime(ext))
     };
+    let head = read_head(path, len.min(META_HEAD)).unwrap_or_default();
+    let mut facts = match ext {
+        "mp4" | "m4v" | "mov" | "m4a" => {
+            let mut facts = parse_mp4(&head);
+            // Non-faststart muxers keep `moov` at the END — one bounded box
+            // walk finds it; mvhd/tkhd sit at its head.
+            if facts.duration_ms.is_none() || facts.w.is_none() {
+                let moov = mp4_moov_head(path, len);
+                if !moov.is_empty() {
+                    mp4_header_facts(&moov, &mut facts);
+                }
+            }
+            facts
+        }
+        "mkv" | "webm" => parse_mkv(&head),
+        "avi" => parse_avi(&head),
+        "wav" => parse_wav(&head),
+        "flac" => parse_flac(&head),
+        "mp3" | "aac" => parse_mp3(&head),
+        "ogg" | "oga" | "opus" => parse_ogg(&head),
+        _ => MediaFacts::default(),
+    };
+    // Signature label whenever the container parser didn't name itself.
+    if !facts.pairs.iter().any(|p| p.k == "format") {
+        if let Some(name) = sig_format(&head) {
+            facts.pairs.insert(0, pair("format", name));
+        }
+    }
     let mut payload = payload_shell("media");
     payload.media = Some(MediaPreview {
         path: path.to_string_lossy().to_string(),
         mime: mime.to_string(),
         kind: kind.to_string(),
-        duration_ms: None,
-        w: None,
-        h: None,
+        duration_ms: facts.duration_ms,
+        w: facts.w,
+        h: facts.h,
+        pairs: if facts.pairs.is_empty() {
+            None
+        } else {
+            Some(facts.pairs)
+        },
     });
     payload
 }
@@ -839,9 +1018,9 @@ fn audio_mime(ext: &str) -> &'static str {
     }
 }
 
-/// File branch: sniff family, build payload. Size caps live in each builder
-/// and run BEFORE any decode; every family that can fail has a real fallback
-/// (signature META / HEX), so a bad file never fails the whole call.
+/// File branch: richest family first, then the §B fallback ladder (text head →
+/// hex head → magic card). Every path yields `Ok` for a readable regular file;
+/// `Err` survives only when the bytes genuinely cannot be read.
 fn build_file(path: &Path, meta: &fs::Metadata) -> Result<PreviewPayload, String> {
     let len = meta.len();
     let ext = path
@@ -850,57 +1029,157 @@ fn build_file(path: &Path, meta: &fs::Metadata) -> Result<PreviewPayload, String
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
 
-    match family_for_ext(&ext) {
-        Family::Text => match build_text(path, len, ext == "svg")? {
-            Some(t) => Ok(text_payload(t)),
-            // A text extension over binary bytes (bplist, packed rtf…) → HEX.
-            None => hex_payload(path, len),
-        },
-        Family::Hex => hex_payload(path, len),
-        Family::Image => match build_image(path, len) {
-            Some(img) => Ok(image_payload(img)),
-            // Unsupported codec / oversize / decode failure → META (§B).
-            None => meta_file(path, len, &ext, None),
-        },
-        Family::Media => Ok(media_payload(path, &ext)),
-        Family::List => list_or_meta(path, len, &ext),
-        Family::TextZip => match zip_xml_text(path, &ext)? {
-            Some(t) => Ok(text_payload(t)),
-            None => zip_list_or_meta(path, len), // docx/odt without the part → LIST
-        },
+    // Empty file: no family can show bytes that don't exist — say so honestly.
+    if len == 0 {
+        let mut pairs = vec![pair("format", "empty file".to_string())];
+        if let Some(d) = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        {
+            pairs.push(pair("modified", fmt_unix_utc(d.as_secs())));
+        }
+        return Ok(meta_payload(pairs, &[], Some(0), &ext));
+    }
+
+    // `.ts` is BOTH an MPEG transport stream and TypeScript — let the bytes
+    // decide before the extension table gets a say.
+    let mut family = family_for_ext(&ext);
+    if family == Family::Media && ext == "ts" {
+        family = match read_head(path, len.min(512)) {
+            Ok(head) if !is_mpegts(&head) => Family::Text,
+            _ => Family::Media,
+        };
+    }
+
+    match family {
+        Family::Text => {
+            if let Ok(Some(t)) = build_text(path, len, ext == "svg") {
+                return Ok(text_payload(t));
+            }
+            // Binary bytes under a text extension (bplist, packed rtf) → ladder.
+        }
+        Family::Hex => {
+            // §A maps these straight to HEX — the ladder's text rung never
+            // hijacks an explicitly-binary extension.
+            let head = read_head(path, len.min(HEX_CAP))?;
+            return Ok(hex_payload(&head, len));
+        }
+        Family::Image => {
+            if let Some(img) = build_image(path, len) {
+                return Ok(image_payload(img));
+            }
+            // Unsupported codec / oversize / decode failure → magic card (§B).
+            if let Ok(p) = meta_file(path, len, &ext, None) {
+                return Ok(p);
+            }
+        }
+        Family::Media => return Ok(media_payload(path, &ext, len)),
+        Family::List => {
+            if let Ok(p) = list_or_meta(path, len, &ext) {
+                return Ok(p);
+            }
+        }
+        Family::TextZip => {
+            if let Some(t) = zip_xml_text(path, &ext) {
+                return Ok(text_payload(t));
+            }
+            // docx/odt without the document part → zip central dir.
+            if let Ok(p) = zip_list_or_meta(path, len) {
+                return Ok(p);
+            }
+        }
         Family::Db => {
             if has_sqlite_magic(path, len) {
-                match build_db(path) {
-                    Ok(db) => Ok(db),
-                    Err(_) => meta_file(path, len, &ext, None), // corrupt → signature META
+                if let Ok(db) = build_db(path) {
+                    return Ok(db);
                 }
-            } else {
-                hex_payload(path, len) // §A: non-sqlite .db (LevelDB…) → HEX
+                // Corrupt sqlite → signature META (§B) — real magic bytes.
+                if let Ok(p) = meta_file(path, len, &ext, None) {
+                    return Ok(p);
+                }
+            }
+            // Non-sqlite .db (LevelDB…) → ladder rung 2 (HEX, §A).
+        }
+        Family::Meta => {
+            if let Ok(p) = meta_file(path, len, &ext, None) {
+                return Ok(p);
             }
         }
-        Family::Meta => meta_file(path, len, &ext, None),
         Family::Sniff => {
-            let head = read_head(path, len.min(META_HEAD))?;
-            match sniff_head(&head) {
-                Sniffed::Meta => meta_file(path, len, &ext, Some(head)),
-                Sniffed::Zip => zip_list_or_meta(path, len),
-                Sniffed::Tar => list_or_meta(path, len, "tar"),
-                Sniffed::Iso => list_or_meta(path, len, "iso"),
-                Sniffed::Db => match build_db(path) {
-                    Ok(db) => Ok(db),
-                    Err(_) => meta_file(path, len, &ext, Some(head)),
-                },
-                Sniffed::Image => match build_image(path, len) {
-                    Some(img) => Ok(image_payload(img)),
-                    None => meta_file(path, len, &ext, Some(head)),
-                },
-                Sniffed::Text => match build_text(path, len, false)? {
-                    Some(t) => Ok(text_payload(t)),
-                    None => hex_payload(path, len),
-                },
-                Sniffed::Hex => hex_payload(path, len),
+            if let Ok(head) = read_head(path, len.min(META_HEAD)) {
+                let attempt = match sniff_head(&head) {
+                    Sniffed::Meta => meta_file(path, len, &ext, Some(head)),
+                    Sniffed::Zip => zip_list_or_meta(path, len),
+                    Sniffed::Tar => list_or_meta(path, len, "tar"),
+                    Sniffed::Iso => list_or_meta(path, len, "iso"),
+                    Sniffed::Db => {
+                        build_db(path).or_else(|_| meta_file(path, len, &ext, Some(head)))
+                    }
+                    Sniffed::Image => match build_image(path, len) {
+                        Some(img) => Ok(image_payload(img)),
+                        None => meta_file(path, len, &ext, Some(head)),
+                    },
+                    // Text/Hex rungs from the bytes already in hand — no re-read.
+                    Sniffed::Text => match text_from_head(&head, len, false) {
+                        Some(t) => Ok(text_payload(t)),
+                        None => Ok(hex_payload(&head, len)),
+                    },
+                    Sniffed::Hex => Ok(hex_payload(&head, len)),
+                };
+                if let Ok(p) = attempt {
+                    return Ok(p);
+                }
             }
         }
+    }
+
+    ladder(path, len)
+}
+
+/// Fallback ladder (§B): TEXT head (encoding-detected, from the head bytes
+/// already paid for) → HEX head. The hex rung cannot fail — the 64 KB head
+/// always covers the 4 KB window — so every file with one readable head gets
+/// a REAL card; `Err` survives only when the head itself cannot be read.
+/// (Rung 3/4 — the magic/metadata card — are `build_file`'s explicit
+/// branches: Sniffed::Meta, image/db decode failures, Family::Meta.)
+fn ladder(path: &Path, len: u64) -> Result<PreviewPayload, String> {
+    let head = read_head(path, len.min(META_HEAD))?;
+
+    // Rung 1: text — a text-ish file the extension table didn't map.
+    if let Some(t) = text_from_head(&head, len, false) {
+        return Ok(text_payload(t));
+    }
+
+    // Rung 2: hex head (§A: unknown binary stays bytes, never garbage text).
+    Ok(hex_payload(&head, len))
+}
+
+/// MPEG transport streams repeat the 0x47 sync byte every 188-byte packet; a
+/// lone leading 0x47 is far too weak (plain ASCII 'G' starts plenty of source
+/// files), so both syncs are required.
+fn is_mpegts(head: &[u8]) -> bool {
+    head.len() >= 189 && head[0] == 0x47 && head[188] == 0x47
+}
+
+/// Honest type label from the FILE EXTENSION (paired with, never replacing,
+/// the signature-derived `format` on the magic card).
+fn ext_class(ext: &str) -> &'static str {
+    match ext {
+        "exe" | "dll" | "msi" | "so" | "dylib" | "efi" | "sys" | "drv" | "jar" | "apk"
+        | "deb" | "rpm" => "executable",
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
+        | "epub" | "mobi" | "rtf" => "document",
+        "zip" | "7z" | "rar" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "lz4" | "cab"
+        | "wim" => "archive",
+        "vhd" | "vhdx" | "vmdk" | "img" | "iso" | "dmg" => "disk image",
+        "ttf" | "otf" | "ttc" | "woff" | "woff2" | "fon" => "font",
+        "" => "unknown",
+        _ if IMAGE_EXTS.contains(&ext) => "image",
+        _ if VIDEO_EXTS.contains(&ext) || AUDIO_EXTS.contains(&ext) => "media",
+        _ if DB_EXTS.contains(&ext) => "database",
+        _ if TEXT_EXTS.contains(&ext) => "text",
+        _ => "binary",
     }
 }
 
@@ -977,13 +1256,28 @@ fn zip_list(path: &Path) -> Result<PreviewPayload, String> {
     for i in 0..total.min(LIST_CAP) {
         let file = archive.by_index(i).map_err(unreadable)?;
         let is_dir = file.is_dir();
-        entries.push(list_entry(
+        let mut entry = list_entry(
             file.name().to_string(),
             if is_dir { None } else { Some(file.size()) },
             is_dir,
-        ));
+        );
+        if !is_dir {
+            entry.method = Some(zip_method(file.compression()));
+        }
+        entries.push(entry);
     }
-    Ok(finish_list(entries, total > LIST_CAP, Some(total as u64)))
+    Ok(finish_list(entries, total > LIST_CAP, Some(total as u64), "zip"))
+}
+
+/// Archive-tool naming for the central dir's method byte: the two common
+/// methods get the conventional short names, the rest keep the crate's own
+/// canonical name ("Bzip2", "Zstd", "Lzma", "Xz", "Unknown(n)"…).
+fn zip_method(m: zip::CompressionMethod) -> String {
+    match m {
+        zip::CompressionMethod::Stored => "Store".to_string(),
+        zip::CompressionMethod::Deflated => "Deflate".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Runs a LIST builder; any failure falls back to signature META (§B — a bad
@@ -1029,7 +1323,7 @@ fn sheet_list(path: &Path, ext: &str) -> Result<PreviewPayload, String> {
         .into_iter()
         .map(|name| list_entry(name, None, false))
         .collect();
-    Ok(finish_list(entries, total > LIST_CAP, Some(total as u64)))
+    Ok(finish_list(entries, total > LIST_CAP, Some(total as u64), "sheet"))
 }
 
 /// Collects `attr` values from every `open`-tag occurrence, scanning a
@@ -1115,11 +1409,16 @@ fn tar_list(path: &Path) -> Result<PreviewPayload, String> {
             }
             _ => {
                 if !name.is_empty() {
-                    entries.push(list_entry(
+                    let mut entry = list_entry(
                         name.trim_end_matches("/").to_string(),
                         Some(size),
                         typeflag == b'5',
-                    ));
+                    );
+                    if typeflag != b'5' {
+                        // tar members are uncompressed by definition.
+                        entry.method = Some("Store".to_string());
+                    }
+                    entries.push(entry);
                 }
             }
         }
@@ -1139,6 +1438,7 @@ fn tar_list(path: &Path) -> Result<PreviewPayload, String> {
         entries,
         truncated,
         if truncated { None } else { Some(total as u64) },
+        "tar",
     ))
 }
 
@@ -1261,6 +1561,7 @@ fn iso_list(path: &Path) -> Result<PreviewPayload, String> {
         entries,
         !full_dir || total > LIST_CAP as u64,
         if full_dir { Some(total) } else { None },
+        "iso",
     ))
 }
 
@@ -1281,22 +1582,16 @@ fn list_or_meta(path: &Path, len: u64, ext: &str) -> Result<PreviewPayload, Stri
 // ---------------------------------------------------------------------------
 
 /// Extracts the document part with a 64 KB decompression cap, strips tags to
-/// plain lines, and never fails the call (caller falls back to a zip LIST).
-fn zip_xml_text(path: &Path, ext: &str) -> Result<Option<TextPreview>, String> {
-    let mut archive = match zip_open(path) {
-        Ok(a) => a,
-        Err(_) => return Ok(None),
-    };
+/// plain lines; `None` on any failure — the caller falls back to a zip LIST.
+fn zip_xml_text(path: &Path, ext: &str) -> Option<TextPreview> {
+    let mut archive = zip_open(path).ok()?;
     let part = if ext == "docx" {
         "word/document.xml"
     } else {
         "content.xml"
     };
-    // Missing part / read error → Ok(None): the caller falls back to a LIST.
-    let (xml, hit_cap) = match zip_part_text(&mut archive, part, TEXT_CAP) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
+    // Missing part / read error → None: the caller falls back to a LIST.
+    let (xml, hit_cap) = zip_part_text(&mut archive, part, TEXT_CAP).ok()?;
 
     // XML → text via an explicit tag walk: paragraph/cell closes and line
     // breaks become newlines, tabs stay tabs, run/span markup is dropped so
@@ -1362,14 +1657,14 @@ fn zip_xml_text(path: &Path, ext: &str) -> Result<Option<TextPreview>, String> {
         }
     }
     if lines.is_empty() && total == 0 {
-        return Ok(None); // nothing readable → caller falls back to LIST
+        return None; // nothing readable → caller falls back to LIST
     }
-    Ok(Some(TextPreview {
+    Some(TextPreview {
         truncated: hit_cap || total > TEXT_LINES as u64,
         total_lines: if hit_cap { None } else { Some(total) },
         lines,
         encoding: Some("utf-8".to_string()),
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,6 +1701,8 @@ fn build_db(path: &Path) -> Result<PreviewPayload, String> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(unreadable)?;
+    // Bounded lock wait — a busy database degrades to the META fallback.
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(250));
 
     let mut stmt = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -1423,25 +1720,74 @@ fn build_db(path: &Path) -> Result<PreviewPayload, String> {
     drop(stmt);
 
     let truncated = names.len() > DB_TABLES_CAP;
+    // Column NAMES double as the count — one pragma pass per table; a table
+    // whose pragma fails (virtual/corrupt) degrades to `columns: null`, it
+    // never sinks the whole payload.
     let mut col_stmt = conn
-        .prepare("SELECT count(*) FROM pragma_table_info(?)")
+        .prepare("SELECT name FROM pragma_table_info(?)")
         .map_err(unreadable)?;
     let mut tables = Vec::with_capacity(names.len().min(DB_TABLES_CAP));
-    for name in names.iter().take(DB_TABLES_CAP) {
-        // Column metadata only — count of COLUMNS via the pragma table-valued
-        // function; NEVER count rows (§B).
-        let cols = col_stmt
-            .query_row([name.as_str()], |row| row.get::<_, u64>(0))
-            .map_err(unreadable)?;
+    for (i, name) in names.iter().take(DB_TABLES_CAP).enumerate() {
+        let columns: Option<Vec<String>> = col_stmt
+            .query_map([name.as_str()], |row| row.get::<_, String>(0))
+            .ok()
+            .map(|rows| rows.filter_map(Result::ok).collect());
+        // First rows of the leading tables: bounded LIMIT, display-capped
+        // cells; per-table errors leave `rows` absent (schema still real).
+        let rows = match &columns {
+            Some(cols) if !cols.is_empty() && i < DB_ROWS_TABLES => db_sample_rows(&conn, name),
+            _ => None,
+        };
         tables.push(DbTable {
             name: name.clone(),
-            cols: cols.min(u64::from(u32::MAX)) as u32,
+            cols: columns.as_ref().map(Vec::len).unwrap_or(0).min(u32::MAX as usize) as u32,
+            columns,
+            rows,
         });
     }
 
     let mut payload = payload_shell("db");
     payload.db = Some(DbPreview { tables, truncated });
     Ok(payload)
+}
+
+/// First rows of one table, cell-by-cell display text. `None` on any error
+/// (locked, corrupt btree, insane schema) — the schema card stands alone.
+fn db_sample_rows(conn: &rusqlite::Connection, table: &str) -> Option<Vec<Vec<String>>> {
+    let quoted = table.replace('"', "\"\"");
+    let sql = format!("SELECT * FROM \"{quoted}\" LIMIT {DB_ROWS}");
+    let mut stmt = conn.prepare(&sql).ok()?;
+    // Wide tables show a bounded head of their columns, never the full width.
+    let ncols = stmt.column_count().min(24);
+    let mut rows = stmt.query([]).ok()?;
+    let mut out: Vec<Vec<String>> = Vec::with_capacity(DB_ROWS);
+    while let Some(row) = rows.next().ok()? {
+        let mut cells = Vec::with_capacity(ncols);
+        for i in 0..ncols {
+            cells.push(db_cell(row.get_ref(i).ok()));
+        }
+        out.push(cells);
+    }
+    Some(out)
+}
+
+/// One sampled cell as honest display text: NULL/integer/real/scrubbed text;
+/// blobs are a byte-size stub, never raw bytes.
+fn db_cell(v: Option<rusqlite::types::ValueRef<'_>>) -> String {
+    use rusqlite::types::ValueRef;
+    let text = match v {
+        None | Some(ValueRef::Null) => "null".to_string(),
+        Some(ValueRef::Integer(i)) => i.to_string(),
+        Some(ValueRef::Real(f)) => format!("{f}"),
+        Some(ValueRef::Text(t)) => scrub_line(&String::from_utf8_lossy(t)),
+        Some(ValueRef::Blob(b)) => return format!("<blob {} B>", b.len()),
+    };
+    if text.chars().count() > DB_CELL {
+        let cut: String = text.chars().take(DB_CELL).collect();
+        format!("{cut}...")
+    } else {
+        text
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1554,10 +1900,22 @@ fn sig_format(head: &[u8]) -> Option<String> {
         Some("zip".to_string())
     } else if head.starts_with(&[0x1F, 0x8B]) {
         Some("gzip".to_string())
+    } else if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        // EBML: DocType ("webm"/"matroska") is the header's first child.
+        let window = &head[..head.len().min(1024)];
+        if window.windows(4).any(|w| w == b"webm") {
+            Some("webm")
+        } else if window.windows(8).any(|w| w == b"matroska") {
+            Some("matroska")
+        } else {
+            Some("ebml")
+        }
+        .map(str::to_string)
     } else if head.starts_with(b"BZh") {
         Some(format!(
             "bzip2 level {}",
-            head[3].saturating_sub(b'0').min(9)
+            // `get`, not indexing: a 3-byte truncated head must not panic.
+            head.get(3).map_or(0, |b| b.saturating_sub(b'0')).min(9)
         ))
     } else if head.starts_with(b"\xfd7zXZ\x00") {
         Some("xz".to_string())
@@ -1710,17 +2068,17 @@ fn meta_file(path: &Path, len: u64, ext: &str, head: Option<Vec<u8>>) -> Result<
         if head.starts_with(&[0x1F, 0x8B]) {
             pairs = parse_gzip(path, len, &head);
         } else if head.starts_with(b"RIFF") && head.len() >= 12 && &head[8..12] == b"WAVE" {
-            pairs = parse_wav(&head);
+            pairs = parse_wav(&head).pairs;
         } else if head.starts_with(b"fLaC") {
-            pairs = parse_flac(&head);
+            pairs = parse_flac(&head).pairs;
         } else if head.starts_with(b"OggS") {
-            pairs = parse_ogg(&head);
+            pairs = parse_ogg(&head).pairs;
         } else if head.starts_with(b"ID3")
             || (head.len() >= 4 && head[0] == 0xFF && head[1] & 0xE0 == 0xE0)
         {
-            pairs = parse_mp3(&head);
+            pairs = parse_mp3(&head).pairs;
         } else if head.len() >= 12 && &head[4..8] == b"ftyp" {
-            pairs = parse_mp4(&head);
+            pairs = parse_mp4(&head).pairs;
         } else if at60_mobi(&head) {
             pairs = parse_mobi(&head);
         } else if head.starts_with(b"!<arch>\n") {
@@ -1746,14 +2104,22 @@ fn meta_file(path: &Path, len: u64, ext: &str, head: Option<Vec<u8>>) -> Result<
         }
     }
 
-    let mut payload = meta_payload(pairs, &head, len);
+    // Real mtime from the canonicalized path — one stat, never a guess.
+    if let Ok(t) = fs::metadata(path).and_then(|m| m.modified()) {
+        if let Ok(d) = t.duration_since(UNIX_EPOCH) {
+            pairs.push(pair("modified", fmt_unix_utc(d.as_secs())));
+        }
+    }
 
-    // §A: executables/system/firmware also carry the HEX head.
+    let mut payload = meta_payload(pairs, &head, Some(len), ext);
+
+    // §A: executables/system/firmware also carry the HEX head. Best-effort —
+    // a failed hex read never sinks the metadata card that already parsed.
     const HEX_HEAD_EXTS: &[&str] = &[
         "exe", "dll", "msi", "so", "dylib", "sys", "drv", "efi", "fw", "rom", "fd", "deb", "rpm",
     ];
     if pe_or_elf || HEX_HEAD_EXTS.contains(&ext) {
-        payload.hex = Some(build_hex(path, len)?);
+        payload.hex = build_hex(path, len).ok();
     }
     Ok(payload)
 }
@@ -2322,6 +2688,25 @@ fn read_name_table_family(path: &Path, off: u64, size: u64) -> Option<String> {
 
 // --- Compressed / audio / video containers (§A: META, no decode) ---
 
+/// Parsed media facts: display pairs + machine values for the MEDIA card.
+#[derive(Default)]
+struct MediaFacts {
+    pairs: Vec<MetaPair>,
+    duration_ms: Option<u64>,
+    w: Option<u32>,
+    h: Option<u32>,
+}
+
+/// Duration sanity: header math on corrupt bytes can yield astronomically
+/// large values; past ~100 years that is malformed data, not a duration.
+fn sane_ms(ms: f64) -> Option<u64> {
+    if ms.is_finite() && ms >= 0.0 && ms <= 315_576_000_000_000.0 {
+        Some(ms as u64)
+    } else {
+        None
+    }
+}
+
 fn parse_gzip(path: &Path, len: u64, head: &[u8]) -> Vec<MetaPair> {
     let mut pairs: Vec<MetaPair> = Vec::new();
     if head.len() < 10 {
@@ -2349,8 +2734,9 @@ fn parse_gzip(path: &Path, len: u64, head: &[u8]) -> Vec<MetaPair> {
     pairs
 }
 
-fn parse_wav(head: &[u8]) -> Vec<MetaPair> {
+fn parse_wav(head: &[u8]) -> MediaFacts {
     let mut pairs: Vec<MetaPair> = Vec::new();
+    let mut duration_ms = None;
     pairs.push(pair("format", "wav".to_string()));
     let mut pos = 12usize;
     let mut byte_rate: u32 = 0;
@@ -2389,17 +2775,23 @@ fn parse_wav(head: &[u8]) -> Vec<MetaPair> {
         if byte_rate > 0 {
             let secs = ds as f64 / f64::from(byte_rate);
             pairs.push(pair("duration", format!("{secs:.1} s")));
+            duration_ms = sane_ms(secs * 1000.0);
         }
     }
-    pairs
+    MediaFacts {
+        pairs,
+        duration_ms,
+        ..Default::default()
+    }
 }
 
-fn parse_flac(head: &[u8]) -> Vec<MetaPair> {
+fn parse_flac(head: &[u8]) -> MediaFacts {
     let mut pairs: Vec<MetaPair> = Vec::new();
     // "fLaC" (4) + block header (4) + STREAMINFO (34); packed fields at 18..26.
     if head.len() < 26 {
-        return pairs;
+        return MediaFacts::default();
     }
+    let mut duration_ms = None;
     pairs.push(pair("format", "flac".to_string()));
     let b = &head[18..26];
     let rate = (u32::from(b[0]) << 12) | (u32::from(b[1]) << 4) | (u32::from(b[2]) >> 4);
@@ -2414,12 +2806,17 @@ fn parse_flac(head: &[u8]) -> Vec<MetaPair> {
         if total_samples > 0 {
             let secs = total_samples as f64 / f64::from(rate);
             pairs.push(pair("duration", format!("{secs:.1} s")));
+            duration_ms = sane_ms(secs * 1000.0);
         }
     }
-    pairs
+    MediaFacts {
+        pairs,
+        duration_ms,
+        ..Default::default()
+    }
 }
 
-fn parse_ogg(head: &[u8]) -> Vec<MetaPair> {
+fn parse_ogg(head: &[u8]) -> MediaFacts {
     let mut pairs: Vec<MetaPair> = vec![pair("format", "ogg".to_string())];
     let window = &head[..head.len().min(4096)];
     let codec = if window.windows(7).any(|w| w == b"\x01vorbis") {
@@ -2436,10 +2833,15 @@ fn parse_ogg(head: &[u8]) -> Vec<MetaPair> {
     if let Some(c) = codec {
         pairs.push(pair("codec", c.to_string()));
     }
-    pairs
+    // Ogg duration needs the final page's granule position (a whole-file
+    // walk) — absent here on purpose, never guessed.
+    MediaFacts {
+        pairs,
+        ..Default::default()
+    }
 }
 
-fn parse_mp3(head: &[u8]) -> Vec<MetaPair> {
+fn parse_mp3(head: &[u8]) -> MediaFacts {
     let mut pairs: Vec<MetaPair> = Vec::new();
     let mut frame_off = 0usize;
     if head.starts_with(b"ID3") && head.len() >= 10 {
@@ -2495,60 +2897,356 @@ fn parse_mp3(head: &[u8]) -> Vec<MetaPair> {
             }
         }
     }
-    pairs
+    // MP3 duration needs bitrate integration across frames (VBR breaks any
+    // cheap estimate) — absent here on purpose, never guessed.
+    MediaFacts {
+        pairs,
+        ..Default::default()
+    }
 }
 
-fn parse_mp4(head: &[u8]) -> Vec<MetaPair> {
-    let mut pairs: Vec<MetaPair> = Vec::new();
-    if head.len() < 16 || &head[4..8] != b"ftyp" {
-        return pairs;
-    }
-    let brand = ascii4(&head[8..12]);
-    pairs.push(pair("format", format!("mp4 ftyp {brand}")));
-    let box_size = (u32be(head, 0).unwrap_or(16) as usize).min(head.len());
-    let mut compatible: Vec<String> = Vec::new();
-    let mut pos = 16usize;
-    while pos + 4 <= box_size {
-        let b = ascii4(&head[pos..pos + 4]);
-        if !b.is_empty() {
-            compatible.push(b);
+fn parse_mp4(head: &[u8]) -> MediaFacts {
+    let mut facts = MediaFacts::default();
+    if head.len() >= 16 && &head[4..8] == b"ftyp" {
+        let brand = ascii4(&head[8..12]);
+        facts
+            .pairs
+            .push(pair("format", format!("mp4 ftyp {brand}")));
+        let box_size = (u32be(head, 0).unwrap_or(16) as usize).min(head.len());
+        let mut compatible: Vec<String> = Vec::new();
+        let mut pos = 16usize;
+        while pos + 4 <= box_size {
+            let b = ascii4(&head[pos..pos + 4]);
+            if !b.is_empty() {
+                compatible.push(b);
+            }
+            pos += 4;
+            if compatible.len() >= 6 {
+                break;
+            }
         }
-        pos += 4;
-        if compatible.len() >= 6 {
-            break;
+        if !compatible.is_empty() {
+            facts.pairs.push(pair("compatible", compatible.join(" ")));
         }
     }
-    if !compatible.is_empty() {
-        pairs.push(pair("compatible", compatible.join(" ")));
-    }
-    // mvhd (movie header) carries timescale/duration — only when inside the head.
-    if let Some(idx) = head.windows(4).position(|w| w == b"mvhd") {
-        let p = idx + 4;
-        let version = *head.get(p).unwrap_or(&0);
-        // v0: creation@+4 mod@+8 ts@+12 dur@+16; v1: creation@+4 mod@+12 ts@+20 dur@+24.
-        let (ts_off, dur_off, wide) = if version == 1 {
-            (20usize, 24usize, true)
-        } else {
-            (12usize, 16usize, false)
-        };
-        let timescale = u32be(head, p + ts_off);
-        if let Some(timescale) = timescale {
-            let duration = if wide {
-                head.get(p + dur_off..p + dur_off + 8).and_then(|s| {
-                    Some((u64::from(u32be(s, 0)?) << 32) | u64::from(u32be(s, 4)?))
-                })
+    mp4_header_facts(head, &mut facts);
+    facts
+}
+
+/// mvhd (timescale → duration) and tkhd (16.16 fixed → pixel size) inside a
+/// moov-shaped buffer. Bounds-checked window scans; nothing is assumed.
+fn mp4_header_facts(buf: &[u8], facts: &mut MediaFacts) {
+    if facts.duration_ms.is_none() {
+        if let Some(idx) = buf.windows(4).position(|w| w == b"mvhd") {
+            let p = idx + 4;
+            let version = *buf.get(p).unwrap_or(&0);
+            // v0: ts@+12 dur@+16; v1: ts@+20 dur@+24 (64-bit).
+            let (ts_off, dur_off, wide) = if version == 1 {
+                (20usize, 24usize, true)
             } else {
-                u32be(head, p + dur_off).map(u64::from)
+                (12usize, 16usize, false)
             };
-            if let Some(duration) = duration {
-                if timescale > 0 && duration > 0 {
-                    let secs = duration as f64 / f64::from(timescale);
-                    pairs.push(pair("duration", format!("{secs:.1} s")));
+            if let Some(timescale) = u32be(buf, p + ts_off) {
+                let duration = if wide {
+                    buf.get(p + dur_off..p + dur_off + 8).and_then(|s| {
+                        Some((u64::from(u32be(s, 0)?) << 32) | u64::from(u32be(s, 4)?))
+                    })
+                } else {
+                    u32be(buf, p + dur_off).map(u64::from)
+                };
+                if let Some(duration) = duration {
+                    if timescale > 0 && duration > 0 {
+                        let secs = duration as f64 / f64::from(timescale);
+                        if let Some(ms) = sane_ms(secs * 1000.0) {
+                            facts.duration_ms = Some(ms);
+                            facts.pairs.push(pair("duration", format!("{secs:.1} s")));
+                        }
+                    }
                 }
             }
         }
     }
-    pairs
+    if facts.w.is_none() {
+        if let Some(idx) = buf.windows(4).position(|w| w == b"tkhd") {
+            let p = idx + 4;
+            let version = *buf.get(p).unwrap_or(&0);
+            // Fixed32 width/height close the box: v0 @76/80, v1 @84/88.
+            let (w_off, h_off) = if version == 1 {
+                (84usize, 88usize)
+            } else {
+                (76usize, 80usize)
+            };
+            let w = buf.get(p + w_off..p + w_off + 4).and_then(|s| u32be(s, 0));
+            let h = buf.get(p + h_off..p + h_off + 4).and_then(|s| u32be(s, 0));
+            if let (Some(w), Some(h)) = (w, h) {
+                // 16.16 fixed point — only whole, non-zero pixels.
+                if w >= 0x1_0000 && h >= 0x1_0000 {
+                    facts.w = Some(w >> 16);
+                    facts.h = Some(h >> 16);
+                }
+            }
+        }
+    }
+}
+
+/// Non-faststart mp4-family files keep `moov` at the END. One bounded
+/// top-level box walk (≤32 boxes, ≤256 KB of moov — mvhd/tkhd sit at its
+/// head) locates it without ever reading the media data.
+fn mp4_moov_head(path: &Path, len: u64) -> Vec<u8> {
+    const BOXES: u32 = 32;
+    const MOOV_CAP: u64 = 256 * 1024;
+    let mut off = 0u64;
+    for _ in 0..BOXES {
+        if off + 16 > len {
+            break;
+        }
+        let hdr = match read_at(path, off, 16) {
+            Ok(h) if h.len() == 16 => h,
+            _ => break,
+        };
+        let mut size = u64::from(u32be(&hdr, 0).unwrap_or(0));
+        let kind = &hdr[4..8];
+        let mut body = off + 8;
+        if size == 1 {
+            // 64-bit extent: the wide size follows the type.
+            let wide: [u8; 8] = match read_at(path, off + 8, 8)
+                .ok()
+                .and_then(|w| w.try_into().ok())
+            {
+                Some(w) => w,
+                None => break,
+            };
+            size = u64::from_be_bytes(wide);
+            body = off + 16;
+        } else if size == 0 {
+            size = len.saturating_sub(off); // box runs to EOF
+        }
+        if size < 8 {
+            break; // malformed — never chase a shrinking box
+        }
+        if kind == b"moov" {
+            return read_at(path, body, size.min(MOOV_CAP)).unwrap_or_default();
+        }
+        let next = off.saturating_add(size);
+        if next <= off || next >= len {
+            break;
+        }
+        off = next;
+    }
+    Vec::new()
+}
+
+// --- Matroska/WebM (EBML): duration + first video track size, bounded ---
+
+/// One EBML element header: `(id, data_size, total_header_len, unknown_size)`.
+/// `None` on truncation; the unknown-size marker is flagged, never chased
+/// past the buffer.
+fn ebml_element(buf: &[u8], pos: usize) -> Option<(u64, u64, usize, bool)> {
+    let (id, id_len) = ebml_vint(buf, pos)?; // raw bytes: the marker bits ARE the id
+    let (size, size_len, unknown) = ebml_size(buf, pos + id_len)?;
+    Some((id, size, id_len + size_len, unknown))
+}
+
+/// Reads an EBML VINT at `pos`: the raw big-endian bytes (keeping the
+/// length-descriptor bit, so IDs compare directly) and the byte length.
+fn ebml_vint(buf: &[u8], pos: usize) -> Option<(u64, usize)> {
+    let first = *buf.get(pos)?;
+    if first == 0 {
+        return None; // the descriptor would need a 9th byte
+    }
+    let len = first.leading_zeros() as usize + 1;
+    if len > 8 {
+        return None;
+    }
+    let mut raw = 0u64;
+    for i in 0..len {
+        raw = (raw << 8) | u64::from(*buf.get(pos + i)?);
+    }
+    Some((raw, len))
+}
+
+/// The SIZE half: strips the descriptor bit; flags the all-ones unknown-size
+/// marker. VINT widths cap sizes at 2^56−1 by construction.
+fn ebml_size(buf: &[u8], pos: usize) -> Option<(u64, usize, bool)> {
+    let (raw, len) = ebml_vint(buf, pos)?;
+    let value = raw & !(1u64 << (7 * len));
+    let unknown = value == (1u64 << (7 * len)) - 1;
+    Some((value, len, unknown))
+}
+
+/// Bounded direct-children scan of one EBML container `[start, end)`. Never
+/// reads outside the buffer, enforces forward progress, caps iterations.
+fn ebml_scan<F: FnMut(u64, usize, usize)>(buf: &[u8], start: usize, end: usize, mut f: F) {
+    let mut pos = start.min(end);
+    for _ in 0..256 {
+        if pos >= end {
+            break;
+        }
+        let Some((id, size, hdr, unknown)) = ebml_element(buf, pos) else {
+            break;
+        };
+        let data = pos + hdr; // hdr ≤ 16, pos < end ≤ 64 KB — no overflow
+        if data > end {
+            break;
+        }
+        let elem_end = if unknown {
+            end
+        } else {
+            data.saturating_add(usize::try_from(size).unwrap_or(usize::MAX))
+                .min(end)
+        };
+        f(id, data, elem_end);
+        if elem_end <= pos {
+            break; // degenerate size — refuse to spin
+        }
+        pos = elem_end;
+    }
+}
+
+fn ebml_uint(buf: &[u8], start: usize, end: usize) -> Option<u64> {
+    let n = end.saturating_sub(start).min(8);
+    if n == 0 {
+        return None;
+    }
+    let s = buf.get(start..start + n)?;
+    let mut v = 0u64;
+    for &b in s {
+        v = (v << 8) | u64::from(b);
+    }
+    Some(v)
+}
+
+fn ebml_float(buf: &[u8], start: usize, end: usize) -> Option<f64> {
+    let n = end.saturating_sub(start);
+    let s = buf.get(start..start + n)?;
+    match n {
+        4 => Some(f64::from(f32::from_be_bytes(s.try_into().ok()?))),
+        8 => Some(f64::from_be_bytes(s.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+fn parse_mkv(head: &[u8]) -> MediaFacts {
+    let mut facts = MediaFacts::default();
+    // DocType is the EBML header's first child — always within the first ~64 B.
+    let window = &head[..head.len().min(1024)];
+    let format = if window.windows(4).any(|w| w == b"webm") {
+        "webm"
+    } else if window.windows(8).any(|w| w == b"matroska") {
+        "matroska"
+    } else {
+        "ebml"
+    };
+    facts.pairs.push(pair("format", format.to_string()));
+
+    // Segment (usually the 2nd top-level element) bounds everything below.
+    let mut segment: Option<(usize, usize)> = None;
+    let mut start = 0usize;
+    for _ in 0..8 {
+        let Some((id, size, hdr, unknown)) = ebml_element(head, start) else {
+            break;
+        };
+        let data = start + hdr;
+        let end = if unknown {
+            head.len()
+        } else {
+            data.saturating_add(usize::try_from(size).unwrap_or(usize::MAX))
+                .min(head.len())
+        };
+        if id == 0x1853_8067 {
+            segment = Some((data, end));
+            break;
+        }
+        if end <= start {
+            break;
+        }
+        start = end;
+    }
+    let Some((seg_start, seg_end)) = segment else {
+        return facts;
+    };
+
+    let mut scale_ns = 1_000_000u64; // EBML default: nanoseconds per tick
+    let mut ticks: Option<f64> = None;
+    ebml_scan(head, seg_start, seg_end, |id, data, end| match id {
+        0x1549_A966 => {
+            // Info: TimecodeScale + Duration.
+            ebml_scan(head, data, end, |iid, idata, iend| match iid {
+                0x2AD7_B1 => {
+                    scale_ns = ebml_uint(head, idata, iend)
+                        .filter(|v| *v > 0)
+                        .unwrap_or(scale_ns)
+                }
+                0x4489 => ticks = ebml_float(head, idata, iend),
+                _ => {}
+            });
+        }
+        0x1654_AE6B => {
+            // Tracks → first video TrackEntry → pixel size.
+            ebml_scan(head, data, end, |tid, tdata, tend| {
+                if tid != 0xAE {
+                    return; // TrackEntry
+                }
+                let mut video = false;
+                ebml_scan(head, tdata, tend, |cid, cdata, cend| match cid {
+                    0x83 => video = ebml_uint(head, cdata, cend) == Some(1),
+                    0xE0 if video => {
+                        // Video: PixelWidth / PixelHeight.
+                        ebml_scan(head, cdata, cend, |vid, vdata, vend| match vid {
+                            0xB0 => {
+                                facts.w = ebml_uint(head, vdata, vend)
+                                    .and_then(|v| u32::try_from(v).ok())
+                            }
+                            0xBA => {
+                                facts.h = ebml_uint(head, vdata, vend)
+                                    .and_then(|v| u32::try_from(v).ok())
+                            }
+                            _ => {}
+                        })
+                    }
+                    _ => {}
+                });
+            });
+        }
+        _ => {}
+    });
+
+    if let Some(t) = ticks {
+        facts.duration_ms = sane_ms(t * scale_ns as f64 / 1_000_000.0);
+        if let Some(ms) = facts.duration_ms {
+            facts
+                .pairs
+                .push(pair("duration", format!("{:.1} s", ms as f64 / 1000.0)));
+        }
+    }
+    facts
+}
+
+fn parse_avi(head: &[u8]) -> MediaFacts {
+    let mut facts = MediaFacts::default();
+    facts.pairs.push(pair("format", "avi".to_string()));
+    let Some(idx) = head.windows(4).position(|w| w == b"avih") else {
+        return facts;
+    };
+    // 'avih' main header: 4-byte size precedes the type; the body follows.
+    let body = idx + 8;
+    let micro = u32le(head, body).unwrap_or(0); // microseconds per frame
+    let frames = u32le(head, body + 16).unwrap_or(0);
+    let w = u32le(head, body + 32).unwrap_or(0);
+    let h = u32le(head, body + 36).unwrap_or(0);
+    if micro > 0 && frames > 0 {
+        facts.duration_ms = sane_ms(f64::from(micro) * f64::from(frames) / 1000.0);
+        if let Some(ms) = facts.duration_ms {
+            facts
+                .pairs
+                .push(pair("duration", format!("{:.1} s", ms as f64 / 1000.0)));
+        }
+    }
+    if w > 0 && h > 0 {
+        facts.w = Some(w);
+        facts.h = Some(h);
+    }
+    facts
 }
 
 fn parse_mobi(head: &[u8]) -> Vec<MetaPair> {

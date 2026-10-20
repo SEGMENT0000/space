@@ -13,9 +13,7 @@ DESIGN.md + PRODUCT.md by the visual-research agent. Implementation agents: this
 3. **Uppercase rule:** DESIGN.md:177 wins over the ins/ look — sentence-case Geist for
    all labels; uppercase mono ONLY for inherently-upper data (hex bytes, signatures
    like `ELF`/`MZ`, extensions, units, mounts).
-4. **Nesting channels apply to the existing 2-level frames only** (depth 0/1); the
-   data contract is `getChildren(depth=2)` → `entries[].sub[]`. No deeper emission
-   this wave.
+4. **Nesting channels apply at every emitted depth.** The frame starts with the payload's two levels (`getChildren(depth=2)` → `entries[].sub[]`) and extends lazily through the renderer's `expanded` map (one `getChildren(depth=1)` per large directory), capped at `MAX_INTERIOR_DEPTH = 5`; the depth ladder below already defines the stroke/fill steps and `gl.ts` implements them.
 
 ---
 
@@ -188,7 +186,7 @@ values `--ink`, hero `.stat` `--ink`. Chip borders `--hairline` (never strong).
 Shared: radius 0, no shadow, `0.5px solid --hairline-strong`, inset 4px, head 22
 (28 at w≥320), transitions `background 120ms var(--ease-out)` only.
 
-## 3. Map interior structure (existing depth 0/1)
+## 3. Map interior structure (recursive, depth 0..5)
 
 Goal: a parent at deep zoom reads as an organized container, never confetti.
 
