@@ -1,117 +1,359 @@
-# Design System: space
+# space — native design specification
 
-## Overview
+Status: implementation spec for the Iced desktop application.
+Scope: `src/ui/theme.rs` and the visual language applied by the native shell.
 
-**Thesis — the instrument panel.** `space` is a read-only disk instrument: numbers are primary, the treemap owns every saturated pixel, and the chrome is floating panels on near-black that never compete with the data. The world is dark-first (`[data-theme]` flips both, `styles/tokens.css`); light exists as a full parity block resolved from the same token names. Warm signal orange (`#e8654a` dark / `#c9462e` light) is spent only on the primary action, selection, and real warnings — one accent, rationed.
+## 1. Intent
 
-Every visual constant below lives in `space/src/styles/{tokens,primitives}.css` unless another path is cited. Nothing aspirational survives: if a rule is named here, the code enforces it.
+`space` should read as a precision instrument, not a dashboard template. The
+treemap is the protagonist; chrome is quiet, flat, and structurally honest.
+Surfaces feel like paper, rules are hairlines, measurements are mono, and a
+single sage accent marks interaction. Color is information: it belongs to file
+categories and state, not to decoration.
 
-## The world tokens (`styles/tokens.css`)
+Three rules govern every screen:
 
-- **Ground** `--bg`: `#0b0b0d` dark (default) / `#f1f1f3` light. Floating `.panel` surfaces sit on the ground via `--bg-elevated`: `#17171b` dark / `#ffffff` light, radius `--r-panel: 14px`, edge = `--shadow-panel` (0.5px hairline + 1px soft rest) plus `--panel-edge` (inset 1px top highlight: `rgba(255,255,255,.045)` dark / `.5` light). Floating layers instead use `.float`: `--r-menu: 12px` + `--shadow-menu` (heavy drop + 0.5px hairline) — menus, palette, hover cards only.
-- **Fills and lines**: `--fill-quiet/hover/active` steps (dark `rgba(255,255,255,.045/.075/.11)`, light on-black `.035/.055/.085`); hairlines `--hairline` (`.075` dark) and `--hairline-strong` (`.15`). Ink ladder `--ink / --ink-2 / --ink-3` (`#f4f4f6` at 100/62/40% dark, `#1c1c1f` at 100/66/42% light). Sunken control beds `--bg-sunken #0d0d0f` dark, `#ebebed` light.
-- **Signals**: accent + `--accent-soft` (selection/focus/marquee), `--accent-ink` (white on light, `#201009` on the dark orange for contrast), `--danger` `#e5544b`/`#c7372f`, `--warn` `#d9a23f`/`#a06a15`, `--focus` = accent at 50–55% alpha, `--scrim`.
-- **Radii ladder**: 14 panel · 12 menu · 8 control/plate · 7 row · 6 chip (`--r-chip`). Keycaps 5px (`.kbd`). Treemap tiles are square-cornered — data has no radius.
-- **The two curves** (`--ease-out 0.22,0.9,0.3,1` for state ≈120ms; `--ease-spring 0.32,0.72,0,1` for navigation at 420ms, `ZOOM_MS` in `treemap/TreemapCanvas.tsx`). `prefers-reduced-motion` clamps every animation/transition to 0.01ms globally (`primitives.css`) and the scan sweep parks mid-bed (`scan.css`).
+1. **The data is the ornament.** No background gradients, glows, glass, or
+   decorative chrome compete with the map.
+2. **Structure is drawn, not implied.** Separation comes from 1 px rules,
+   spacing, and tonal steps — not from a field of floating cards.
+3. **One accent, real weights, exact figures.** Interaction is sage; type is
+   Geist; numbers and paths are Geist Mono.
 
-Module map: `src/index.css` is the import manifest and the cascade — tokens → primitives (resets, `.num/.micro/.kbd`, `.panel/.float/.chip`, textures, controls, `.stat`, `.hovercard`, app shell) → per-surface modules (`shell/drives/scan/explorer/rail/map`, each owning exactly one screen's classes). `preview.css` is imported by `previewPlate.ts` so it ships with the renderer's use of plates, not in the manifest.
+The authoritative composition reference is
+`inspiration_images_that_how_should_the_ui_look_like/this_is_main_this_is_how_it_should_look_like.jpg`.
+It defines the airy treemap, quiet top bar, narrow inspector rail, and compact
+status line. The tokens below define exact values.
 
-**Named rule — Flat resting.** `--shadow-panel` carries one 1px rest tone and a soft edge; only floating layers get `--shadow-menu`. A shadow on a resting in-flow surface is a defect.
+## 2. Reference application
 
-## Colors
+- **Top bar — 52 px.** `surface`, one 1 px `hairline` beneath. Wordmark at
+  17 px SemiBold; commands, volume context, and theme control at 12 px. No
+  shadow, no gradient, no faux window chrome.
+- **Main region.** A full-bleed treemap on `bg` with a 318 px inspector rail
+  separated by a 1 px rule. The rail is `surface`; it is not a floating card.
+- **Treemap.** Off-white bed, 1 px gutters between leaves, 3 px group insets,
+  2 px tile radius. Nested pastel category fills carry the only large color
+  field. Labels are category ink. No outer card, no inner glow.
+- **Summary strip.** Four or five compact figures separated by vertical
+  hairlines. Figures at 22 px Geist Mono SemiBold; captions at 12 px.
+- **Status line — 28 px.** 11–12 px `ink_faint` metadata, 1 px `hairline` above.
+- **Category chips.** A small solid 8–10 px swatch, 4 px gap, then the category
+  name in `ink` or `ink_muted`. Never a colored pill, never an orange “s” badge.
+- **Overlays.** Command palette, context menu, and toasts use `surface_raised`,
+  a 1 px `hairline_strong` edge, 8 px radius, and the single overlay shadow.
+- **Window.** Native decoration. Content fills the client area; no fake title
+  bar, no rounded outer frame.
 
-Chrome is grey. The eight-category data palette (`lib/colors.ts`, the single source for GL fills, label ink and the DOM legend) is the only saturated field:
+## 3. Color
 
-| Category | Light | Dark | | Category | Light | Dark |
-|---|---|---|---|---|---|---|
-| Media | `#3d7fdd` | `#4e8ef0` | | Apps | `#d1663c` | `#e07b50` |
-| Documents | `#2f9b8e` | `#3cb3a4` | | Archives | `#c2547a` | `#d76a90` |
-| Code | `#5d9c46` | `#74b457` | | System | `#8a6fc0` | `#a188d9` |
-| Caches | `#d2952c` | `#e0a53f` | | Other | `#7c828b` | `#8d949e` |
+### 3.1 Neutral and interaction tokens
 
-These eight are fixed; Caches always carries the fragment-level hatch (9px diagonal, `TILE_FS` in `treemap/gl.ts`) and rail swatch overlay. **Two-Channel Rule:** every category also wears a text label — depth-0 big tiles even carry a 3.5px swatch before the name; chips are always dot+word (`.chip`).
+| Token | Light | Dark | Use |
+|---|---|---|---|
+| `bg` | `#F5F6F5` | `#121514` | App bed, treemap bed |
+| `surface` | `#FBFCFB` | `#181C1A` | Chrome, panels, rails |
+| `surface_raised` | `#FFFFFF` | `#202522` | Menus, palette, sheets |
+| `surface_sunken` | `#EDF0EE` | `#0D100F` | Inputs, wells, tracks |
+| `surface_hover` | `#F0F2F1` | `#202622` | Hover wash on neutral rows |
+| `surface_pressed` | `#E5E8E6` | `#29302B` | Pressed controls |
+| `ink` | `#1B201D` | `#EDF1EF` | Primary text |
+| `ink_muted` | `#525A56` | `#AAB1AD` | Secondary text |
+| `ink_faint` | `#666E6A` | `#89918D` | Metadata at ≥11 px |
+| `hairline` | `#E2E5E3` | `#282E2A` | Decorative 1 px rules |
+| `hairline_strong` | `#87908A` | `#667069` | Overlay edges, control boundaries |
+| `accent` | `#256B5A` | `#7CC4AE` | Single interaction accent |
+| `accent_ink` | `#F7FBF9` | `#0B241E` | Text/icons on accent |
+| `accent_soft` | `#DDEDE7` | `#173A31` | Selected rows, active command row |
+| `selection` | `#D3E7DE` | `#23453B` | Text-selection wash |
+| `danger` | `#B24A35` | `#E2846D` | Destructive text/icons |
+| `danger_soft` | `#FAEDE9` | `#3A241F` | Destructive well |
+| `warning` | `#8A621C` | `#D6A85C` | Caution |
+| `success` | `#3F704D` | `#7DBB8C` | Completion, positive status |
+| `scrim` | `rgba(19,24,21,.24)` | `rgba(0,0,0,.58)` | Modal scrim only |
+| `shadow` | `rgba(19,24,21,.16)` | `rgba(0,0,0,.55)` | Floating overlays only |
 
-Label ink is derived, not stored: `inkFor()` picks white / black / `#1c1c1f` by the *drawn* fill's relative luminance so every tile label clears 4.5:1 (`lib/colors.ts`); depth-1/2 fills flatten toward `canvasBg` 100/88/76% (`tintFill()`). `canvasBg` = `#0b0b0d` / `#f1f1f3` — same as `--bg` — and the GL clear color is re-resolved at runtime as the first opaque ancestor behind the canvas (`resolveOpaqueField`, `TreemapCanvas.tsx`), so ground and field can never drift.
+Rules:
 
-**Theming flow.** Dark is the default (no stored preference → dark, `App.tsx`); the choice persists in `localStorage["space.theme"]`, applies via `document.documentElement.dataset.theme`, and is overridable by the `?theme=light|dark` deep-link for review harnesses. The renderer re-reads `--accent`, `--accent-soft` and the field through `getComputedStyle`, re-armed by the `theme` prop and a `MutationObserver` on `[data-theme]`; hardcoded accent hexes exist only as unparsed-CSS fallbacks (mirroring the tokens), never as primary sources.
+- `accent` is the only interactive hue. Do not add a second brand color,
+  gradient stop, or “info blue.”
+- Semantic colors are not decoration. A green dot means success, not “this
+  looks nice.”
+- `hairline` is for structure; `hairline_strong` is for boundaries that must
+  survive on a surface. Neither is a text color.
+- `selection` is a wash behind selected text. It is deliberately distinct from
+  `accent_soft`, which marks a selected row or command.
+- Dark mode is a tonal translation, not an inversion and not pure black.
 
-## Typography
+### 3.2 Category palette
 
-Geist + Geist Mono, variable, self-hosted via `@font-face` from `src/fonts/` (Geist-Variable.woff2 ≈68 KB, GeistMono-Variable.woff2 ≈70 KB, `font-display: swap`; the label draw path also pre-loads the four faces it measures with and drops its measure cache on `fonts.ready`). No second family anywhere.
+Order is the `Category` contract: Media, Documents, Code, Caches, Apps,
+Archives, System, Other.
 
-Ladder (all verified in CSS):
+| Category | Light fill | Light ink | Dark fill | Dark ink |
+|---|---|---|---|---|
+| Media | `#F3C8B5` | `#5B392B` | `#5D3B34` | `#F1D5C9` |
+| Documents | `#EFE1B4` | `#594924` | `#534A2D` | `#EFE2BD` |
+| Code | `#CFE0C1` | `#36533A` | `#384127` | `#D6E8D3` |
+| Caches | `#B9E4E9` | `#2E4C55` | `#21474F` | `#CFE9EC` |
+| Apps | `#D6D6F0` | `#453F5F` | `#3D3E59` | `#DFDCF4` |
+| Archives | `#F2CEDC` | `#5D3A47` | `#513849` | `#F2D6E1` |
+| System | `#BBC6CE` | `#3C474F` | `#33393E` | `#DBE1E4` |
+| Other | `#DAD1C6` | `#4F493D` | `#4A4238` | `#E8E2D4` |
 
-| Step | Value | Where |
+Each category also has a `category_soft` wash for rows and chips. Fills are
+muted pastels in light mode and desaturated deep pastels in dark mode; hue
+identity is preserved across appearances. Apps is a flat lilac — never a
+purple-blue gradient.
+
+## 4. Typography
+
+Only two families ship: **Geist** (`Geist-Regular`, `-Medium`, `-SemiBold`,
+`-Bold`) and **Geist Mono** (`GeistMono-Regular`, `-Medium`, `-SemiBold`).
+Inter, Roboto, Arial, Helvetica, Open Sans, and system fallback faces are not
+part of the design. Weights must come from the loaded files; never synthesize
+bold.
+
+| Role | Size / line | Family / weight | Use |
+|---|---|---|---|
+| Micro | 11 / 14 | Geist Medium | Chips, keycaps, dense metadata |
+| Caption | 12 / 16 | Geist Regular | Secondary labels, paths, hints |
+| Body | 13 / 18 | Geist Regular | Controls, rows, prose |
+| Label | 15 / 20 | Geist Medium | Section labels, emphasized values |
+| Heading | 17 / 22 | Geist SemiBold | Panel and screen headings |
+| Title | 22 / 28 | Geist SemiBold | Screen titles, large figures |
+| Display | 28 / 34 | Geist SemiBold | Empty states, hero figures |
+| Figure SM | 12 / 16 | Geist Mono Medium | Table figures |
+| Figure MD | 15 / 20 | Geist Mono Medium | Inspector values |
+| Figure LG | 22 / 26 | Geist Mono SemiBold | Summary strip |
+| Figure XL | 28 / 32 | Geist Mono SemiBold | Hero measurement |
+| Path | 12 / 16 | Geist Mono Regular | File paths, breadcrumb tails |
+| Keycap | 11 / 14 | Geist Mono Medium | Keyboard hints |
+
+- UI text uses 11 px or larger for primary labels, controls, prose and figures.
+  The inspector's densest secondary metadata (preview footers, schema columns,
+  aggregate captions) uses 9.5-10.5 px by explicit exception; it never carries
+  the only copy of an action or state. No product text is smaller than 9.5 px.
+- Use Geist Mono for figures, sizes, paths, IDs, and keyboard hints. Do not set
+  prose in mono.
+- Alignment beats decoration: right-align numeric columns and use tabular
+  figures for comparisons.
+- Letter spacing stays at the font default. No all-caps tracking tricks except
+  short 11 px metadata labels, and even those remain sentence case where space
+  allows.
+
+## 5. Spacing, shape, and structure
+
+**Spacing** follows one four-pixel grid: `4, 8, 12, 16, 24, 32, 48`.
+Use 4 inside compact marks, 8 between related controls, 12 within a section,
+16 for panel padding, 24 between sections, 32 for page margins, 48 for
+empty-state breathing room. Do not introduce 20 or 28 px spacing.
+
+**Radii:** 2 for swatches, treemap tiles, and tiny marks; 4 for buttons, inputs,
+and segmented controls; 6 for panels; 8 for floating overlays; 10 for modal
+sheets. Large cards are not 16–24 px rounded. Pills are reserved for status
+badges, not ordinary controls.
+
+**Controls:** 24 px compact, 28 px default, 32 px prominent. Minimum hit area
+is 28 × 28 px even when the visible glyph is smaller.
+
+**Layout:** top bar 52, status line 30, inspector rail 318, tree/list row 28.
+
+**Hairlines:** 1 px for rules, panel edges, and overlay edges; 1.5 px for
+selected boundaries, category parent outlines, and strong dividers; 2 px focus
+ring with a 1 px offset. Never use 0.5 px rules for structure or 3 px borders
+for emphasis.
+
+**Icons:** 14, 16, or 20 px with a 1.5 px stroke. No filled icon sets mixed with
+line icons. No emoji as product iconography.
+
+**Elevation:** exactly one shadow recipe for floating overlays — `shadow`,
+8 px downward offset, 24 px blur, paired with a 1 px `hairline_strong` edge.
+Panels and cards have no shadow. There is no “hover lift.”
+
+## 6. Treemap semantics
+
+1. **Bed.** The treemap sits directly on `bg`. The light bed is a neutral
+   off-white (`#F5F6F5`), not warm cream or sepia; the dark bed is `#121514`.
+2. **Leaves.** Fill from `category_fill`. A 1 px gutter exposes the bed and
+   keeps the map airy. Tiles use a 2 px radius, never pill shapes.
+3. **Nesting.** A group insets its children by 3 px. Depth is a subtle tint of
+   the category fill: 8% per level toward `surface_raised` in light mode or
+   toward `bg` in dark mode, capped at 24%. Do not jump hue families with depth.
+4. **Parent outlines.** Draw a 1.5 px `category_line` outline, derived by
+   interpolating category ink toward the fill (42% in light, 30% in dark).
+   This is containment, not a heavy border.
+5. **Hidden categories.** Blend 84% toward the bed. The tile should recede but
+   remain discoverable; pair the treatment with the “hidden” label in the
+   legend.
+6. **Hover.** A 1 px `category_line` outline or a 4% ink wash. No scale, glow,
+   or shadow.
+7. **Selection.** A 1.5 px `accent` outline plus a 1 px inner offset. Text stays
+   `category_ink`; do not invert the tile to accent.
+8. **Labels.** Group headers use 11 px Geist Medium; leaf names use 12 px Geist
+   Medium when they fit. Sizes use Geist Mono. Clip with an ellipsis rather than
+   overflowing. If a label cannot fit, omit it — never draw 8 px type.
+9. **Chips and legends.** Solid swatch + label. The swatch carries the hue; the
+   label stays neutral ink. Color is never the only encoding: the inspector,
+   legend, and labels always name the category.
+10. **Figures.** File sizes and percentages are mono. Percentage columns are
+    right-aligned. Avoid repeating a percentage in both label and tooltip.
+
+## 7. States, focus, and selection
+
+- **Hover (neutral):** `surface_hover`. On treemap tiles, use the outline
+  treatment above rather than a filled wash.
+- **Pressed:** `surface_pressed`; no translation or bounce.
+- **Selected row/command:** `accent_soft` fill, `ink` text, and a 2 px `accent`
+  leading rule. The accent rule is the non-color cue.
+- **Keyboard focus:** 2 px `accent` ring with a 1 px offset. It must remain
+  visible on `bg`, `surface`, `surface_raised`, and `accent_soft`.
+- **Text selection:** `selection` behind selected glyphs; keep `ink` as the
+  value color.
+- **Disabled:** `surface_sunken` fill, `ink_faint` text, `hairline` edge, no
+  hover response. Do not apply blanket opacity below 0.55.
+- **Error:** `danger` icon/text, optional `danger_soft` well. Never rely on red
+  alone; pair with a direct sentence.
+- **Warning:** `warning` icon/text with the same pairing rule.
+- **Success:** `success` text or a static 6 px dot. No pulsing indicator.
+- **Loading:** a 1.5 px accent segment on a `surface_sunken` track, using the
+  standard motion durations. No shimmer, orbiting dots, or gradient sweep.
+- **Empty:** Display-size sentence, one muted explanatory line, one primary or
+  outline action. No illustration unless it carries real meaning.
+
+## 8. Motion
+
+One curve: `cubic-bezier(0.16, 1.0, 0.3, 1.0)`.
+
+| Motion | Duration |
+|---|---|
+| Hover / wash | 120 ms |
+| Control state | 160 ms |
+| Overlay enter/exit | 200 ms |
+| Camera / treemap refit | 220 ms |
+| Hard ceiling | 240 ms |
+
+No springs, elastic overshoot, parallax, animated gradients, or looping
+decorative motion. Reduced-motion mode snaps to the final state; the interface
+must remain fully legible without interpolation.
+
+## 9. Light and dark
+
+- **Light:** neutral off-white bed, near-white chrome, ink text. Hairlines are
+  visible but quiet. Category fills are airy pastels; the map should feel like
+  colored paper, not candy.
+- **Dark:** deep green-black bed (`#121514`), slightly lifted chrome, off-white
+  ink. Category fills become deep muted tints with light category ink. Avoid
+  pure black fields and avoid simply inverting the light palette.
+- Hue identity and category order are identical in both themes. Semantic roles
+  never swap.
+- Dark surfaces step by small tonal increments (`bg → surface → raised`), not by
+  borders alone. Light mode uses hairlines more; dark mode uses tonal steps plus
+  hairlines.
+- Scrim and shadow are the only translucent tokens. No translucent panels.
+
+## 10. Contrast
+
+AA targets are verified against the hex tokens. Ratios below are computed, not
+sampled from a screenshot.
+
+| Pair | Light | Dark |
 |---|---|---|
-| Label voice | Geist 11.5/500 ink-2, sentence case | `.micro`, section titles |
-| Figures | Geist Mono tabular (`.num` = `tabular-nums`) | every readout |
-| Stat block | mono 21px/550, `.is-hero` 30px/600, `.is-sm` 15 | `.stat`; rail hero overrides to **34px** (`rail.css`); drives hero stays 30 |
-| Chip | 11px/500 | `.chip` |
-| Body | 13px base; rows/menu 12.5; crumbs 13.5/500; drive names 13/500 | screen modules |
-| Micro figures | 10.5–11px mono | keycaps, status keys, plate values |
-| Tile labels | names 600/11.5 big, 500/10.5 small; selected rides **650**; size line Geist Mono 10.5 at the quietest 4.5:1-safe alpha (≥62%) | `TreemapCanvas.drawLabels` |
-| Boot wordmark | Geist 26/600, sentence "space" | `.boot-mark` (`shell.css`) |
+| `ink` on `bg` | 15.25:1 | 16.12:1 |
+| `ink_muted` on `bg` | 6.56:1 | 8.40:1 |
+| `ink_faint` on `bg` | 4.84:1 | 5.68:1 |
+| `accent` on `bg` | 5.82:1 | 9.07:1 |
+| `danger` on `bg` | 4.94:1 | 6.78:1 |
+| `warning` on `bg` | 5.04:1 | 8.41:1 |
+| `success` on `bg` | 5.33:1 | 8.19:1 |
+| `accent_ink` on `accent` | 6.04:1 | 8.06:1 |
+| `ink` on `selection` | 12.79:1 | 9.28:1 |
+| `danger` on `danger_soft` | 4.68:1 | 5.34:1 |
+| Category ink on fill (minimum) | 5.48:1 | 6.83:1 |
+| Category ink on soft (minimum) | 7.39:1 | 8.80:1 |
+| `hairline_strong` on `bg` (non-text) | 3.04:1 | 3.58:1 |
 
-**Named rule — Label voice.** Uppercase tracked mono labels are banned; mono is reserved for figures, paths, and keycaps (`.kbd`). Sentence case everywhere.
+- All primary, muted, faint, accent, semantic, and category text pairs meet
+  WCAG AA (4.5:1) on `bg`, `surface`, and `surface_sunken`.
+- `hairline_strong` is a non-text boundary token and meets 3:1 on `bg`,
+  `surface`, and `surface_raised` in both themes. On the light sunken well it is
+  just below 3:1, so use `accent` or a focus ring for critical control
+  boundaries there. `hairline` is decorative structure and is not used as the
+  sole boundary for a critical control.
+- Do not place `ink_faint` on category fills. Use `category_ink` there.
+- Disabled controls are exempt from AA but must remain perceivable through
+  position, label, and structure.
 
-## Layout system
+## 11. Anti-patterns
 
-App shell `.app` (column, `100vh`); screens fade in 260ms. Three screens route through `App.tsx`: drives → scan → explorer, with a rendered boot state (wordmark + one honest line, no spinner).
+Do not introduce:
 
-- **Topbar** (explorer): transparent 46px strip on the ground — back/forward icon pair, breadcrumb chain (crumb cells ellipsize at 220px, `…` collapse when the chain exceeds 5), filter field 200→240px on focus (2.5px focus ring), sort segmented control (Size/Name/Type), `Ctrl K` hint chip, rail toggle. Memoized; never re-renders for hover state.
-- **Drives**: one ledger `.panel`; on the ground above it, the lowercase wordmark and a real figure hero — Σ(total − free) across the volumes the system reported, `n volumes · capacity` beneath, an em dash while the query flies (never a guess). Rows read left → right: mount-letter chip · name over mount/fs/kind meta · 8px dot-matrix usage bed whose fill warns past 80% and goes danger past 92% (the pct prints beside it, so the bed is `aria-hidden`) · fixed total/free figure block · one quiet **Scan** action — transparent at rest, one fill step on row hover/focus, never accent-filled (One Accent per Field: the warm spend on this screen belongs to the low/critical tier words) — carrying the whole row's math as its `aria-label` (the keyboard/AT door for the row); the row click is a mouse convenience. Rows carry no rules — the ledger divides by rhythm and the hover fill; one hairline separates it from the keyed legend. Footer: "Read-only · nothing on disk is ever modified."
-- **Scan**: one centered 620px instrument panel — head (root leaf + mount/elapsed), the honest **indeterminate** accent sweep on a 10px dot bed (the progress payload carries no total, so a percentage would be fabrication; the % slot prints a dash), a four-counter band (bytes/files/dirs/skipped) divided by hairlines, a 90-bar rate strip of raw observed deltas quantized to 1/14 height steps, and the walking path at the foot. Failure swaps the meter for a danger band with the engine's message verbatim and selectable.
-- **Content row**: gap 8, padding 0 8 8. The map is one `.panel` that flexes; the **inspector rail is 300px fixed** (`.rail-panel`, `rail.css`) — a second floating panel of hairline-stacked 14px/16px sections: selection/current-folder readout, composition (Categories), and Largest files. The list is the rail's **only** scroll region; ≤900px the rail overlays the map (absolute, default closed) with `-12px 0 32px` depth shadow.
-- **Statusbar**: transparent 30px strip. Left: `Items · Files · Size · Of volume` in `.num` mono, plus, when filters hide categories, a hatch-swatched chip — "`N` categories hidden" — which is a `<button>`: clicking it unhides every category at once (`ExplorerView.tsx` `unhideAll`). Right: quiet `Rescan / Drives / Light|Dark` text buttons.
-- Responsive: ≤560px the sort control hides (the palette retains it), the search narrows progressively, and the Files readout drops; drives rows fold to two lines at ≤720px; scan bands tighten at ≤640/≤460px.
+- purple-blue gradients, mesh gradients, aurora backgrounds, or gradient text;
+- glassmorphism, backdrop blur, frosted panels, or translucent cards;
+- neon glow, colored outer shadows, or “selected” glow;
+- uniform card shadows or a card for every section;
+- pulsing dots, shimmer skeletons, orbiting spinners, or decorative animation;
+- fake window controls, scanlines, grain overlays, or ornamental chrome;
+- the orange “s” badge or any category-as-pill treatment;
+- multiple accent hues or semantic colors used decoratively;
+- saturated treemap fills, rainbow palettes, or hue jumps by depth;
+- text below 11 px, faux bold, or more than four weights in one screen;
+- fully rounded (999 px) ordinary controls, inputs, or panels;
+- color as the only signal for hidden, selected, error, or success states;
+- springy, elastic, or overshooting motion;
+- pure-black dark surfaces or a warm/sepia light bed.
 
-**Fill invariant (`treemap/TreemapCanvas.tsx`).** The renderer owns the frame pipeline: ResizeObserver → relayout at the container's exact aspect → rebuild when fitted-cover would drift > 0.5px. The world is laid out at the canvas aspect, so fit IS an edge-to-edge edge fill, and fit's scale is the zoom **floor**: every viewport path (wheel, `zoomBy`, `zoomToTile`, nav targets, resize) clamps through `enforceFill` (floor lift + world-covers-canvas pin). Letterboxing is structurally impossible — if background shows, a clamp is broken. Ceiling is `14×fit`, raised per-gesture by `zoomCeilingAt()` so the tile under the cursor can always reach the preview request gate (BUG 2).
+## 12. Implementation contract
 
-## Interaction states
+`src/ui/theme.rs` is the single source of truth.
 
-- **Hover.** Map tiles lift one fill step toward white (`HOVER_LIFT 0.12`) plus full-ink label — no ring; selection stays distinct via the warm-accent ring. Rows (drives, rail, palette, menu) step `--fill-hover`/`-active` over 120ms. The hover card is the app's **one readout**: floating `.float` card (name / mono size + share / category chip / count / tail-true path / real actions), flip-and-clamped to its host. Identity (which item) is React state; position is written imperatively via `positionCard` between identity changes — same-tile moves re-render nothing (`ExplorerView.tsx`). Rail rows get the interactive variant with a 150ms leave-grace (`LEAVE_GRACE_MS`), focus parity, and scroll-closes.
-- **Hidden categories.** A toggled-off category's tiles hold their place at alpha **0.16** (legible-silent — "a switched-off cell, not a void"); no hover lift, no label. The legend row wears a struck swatch (hatch overlay + ink-3 label), and the statusbar chip spells the count.
-- **Selection.** 1px warm-accent inner ring drawn inside the tile + `--accent-soft` fill lift scaled per-instance (multi-select works). Rail row tint = `--accent-soft`. Escape clears; Ctrl C copies; Enter drills or opens.
-- **Drill law.** A single click on a directory tile drills ONE level (files still select); a double-click is the same gesture, not a second one — a 500ms drill cooldown (armed on every directory drill) makes `onDown` and the synthesized `dblclick` swallow the tail. Without it, one physical double-click teleported three levels deep the instant deeper layouts loaded from memory. Double-click still opens file previews.
-- **Filter law.** Escape inside the filter box clears the query and blurs; blur alone left the 0.16-filtered map stranded behind a focused-looking field.
-- **Marquee.** shift-drag draws an accent-soft fill + 0.8-stroke rect on the 2D layer; selects depth-0 tiles it overlaps, adds to the selection at release.
-- **Focus.** `:focus-visible` = 2px `--focus` ring, 1px offset (global). Every icon-only button carries `title` **and** `aria-label` (`ui.tsx` `IconBtn`); rail's scanning button announces the full row math.
-- **Zoom instruments** (`map.css`): two 9px crop-mark L-brackets inset 8px bracket the data field; the mono `ZOOM N%` chip at bottom-right only speaks when the view leaves 100% (opacity toggled by the draw loop, never React).
+```rust
+let t = Theme::for_dark(app.dark);
 
-## In-tile previews (`treemap/previewPlate.ts`, `styles/preview.css`)
+container(content).style(move |_| container::Style {
+    background: Some(Background::Color(t.bg)),
+    text_color: Some(t.ink),
+    ..Default::default()
+});
+```
 
-One pooled DOM layer (`.map-previews`, `pointer-events:none`, clipped at the map edge) over the GL field; the draw loop owns position/content/visibility imperatively — React never re-renders a plate. Families render real, read-only content: **TEXT** (mono bed with line-gutter, greyscale syntax — ink steps and weight only; SVG arrives as scrubbed source), **HEX** (4 KB head, 8 B/row, offset/bytes/ascii; confirmed signature bytes get the only accent underline + a key chip), **IMAGE** (decoded thumbnail, 1px frame, crop marks + dimension tab at ≥160px tile width), **LIST** (archives, sheets, sqlite tables as 22px rows with real columns), **META** (key/value pairs, optional rotated edge rail at ≥360×240, signature fallback when nothing parses), **MEDIA** (inert: video first frame, audio readout; duration stamp no transport controls).
+Canonical API:
 
-**Named rule — A directory with an interior never plates; a leaf folder does.** An interior folder's preview IS the nested treemap (its children drawn beneath it, subdivided lazily to files), so a plate may never cover those children or hijack hover identity for what the pointer sees under it (the "every element reads as the parent" failure, user-verified 2026-10-19). But a directory with **no interior to render** — at the depth cap, in a cap-truncated tail, or with an empty/unreadable expansion — would otherwise be a dead grey fill. Those leaf folders request the backend's real folder listing at the LIST gate and plate it with the same table geometry as an archive: files size-sorted, directories name-sorted, honest `folder · N entries` footer. The renderer therefore requests and qualifies an `isDir` tile only when the current frame has no child rect for it, so a folder card can never cover an interior.
+- `Theme::light()`, `Theme::dark()`, `Theme::for_dark(bool)`, `to_iced()`
+- `t.is_dark` (canonical), `t.dark` (compatibility alias; both are set)
+- neutral tokens, semantic tokens, `scrim`, `shadow`
+- `t.category(cat)`, `t.category_soft(cat)`, `t.category_ink(cat)`,
+  `t.on_category(cat)`, `t.category_line(cat)`
+- category arrays for canvas palettes: `category_fill`, `category_soft`,
+  `category_ink`
+- `ui_font(weight)`, `mono_font(weight)`, weight helpers
+- `mix`, `ease`, `truncated`
+- spacing, radii, control, layout, icon, treemap, and motion constants
 
-Mechanics worth copying:
+`to_iced()` maps `bg → background`, `ink → text`, `accent → primary`, and the
+semantic colors to their Iced counterparts. Stock Iced widgets should be styled
+from the same tokens rather than relying on defaults.
 
-- **Pool 24 (> cap 8)**, recycled forever — no DOM churn. Only `≤8` plates visible at once, ranked by visible canvas area with a **1.25× incumbent bias** so continuity survives panning.
-- **Request gate 260×110** fires once per entry per layout generation — intentionally smaller than any render gate, so content is warm before it qualifies. **Deviation, documented:** HEX renders from 330×140 because one offset+bytes+ascii row is meaningless narrower; below a family's render minimum (`PLATE_MIN`) the tile keeps its floating label.
-- **XL listing cap — a plate is a preview instrument, not a map replacement.** A file LIST/DB plate (archive, sheet, sqlite table) offering ≥20 rows on a tile covering ≥72% of the canvas in BOTH axes (a giant archive seen at shallow zoom) is bounded to ≤50% canvas width × ≤42% canvas height, anchored top-left; the map around it stays visible. Table plates render at most 20 rows (`TABLE_ROW_CAP`); the honest `… N more entries` footer carries the remainder. Modest listings (the 13-row class) keep their full-tile preview.
-- **Plate-aware hit-testing — identity matches what the pointer sees.** `hitTest` scans claimed+visible plate slots first: a pointer inside a painted plate box resolves to the plate's owner tile, never to a child tile hidden beneath the paper. Applies to hover, drag, context menu, and the double-click/open paths alike.
-- Every plate paints at its canvas∩tile box (deep zoom can't strand a plate's head off-screen); an unanswered request that survives 30 drawn frames becomes the honest fallback plate ("no preview"), and the tile's floating label is suppressed only while a plate is actually shown.
+Fonts are registered once in `src/ui/mod.rs`. `FONT_UI` is `"Geist"` and
+`FONT_MONO` is `"Geist Mono"`; all text constructors go through
+`ui_font` / `mono_font`.
 
-## Renderer performance contract
+### Implementation notes
 
-- All work rides one rAF loop (`tick()`); idle = zero frames. The loop is panic-latched: one `console.error`, one `space:error` event, then it stops — never spam, never a silent death.
-- **Hover is rAF-aligned and allocation-free**: pointermove only mutates a pending point; one scheduled pass per frame resolves. Crossing tiles patches exactly two 4-byte `aHover` floats in place (`bufferSubData`) and re-issues the instanced draw + label redraw — never a re-upload (identity-checked against `instFrame`). The parent gets `onHoverChange` only when the tile changes; ExplorerView re-renders only the card, the topbar/rail/map subtrees stay memoized.
-- **Crash-class guards**: raw frame indices are bounds-checked before every `refs`/buffer dereference (`hover.current < refs.length`, `drag.idx = -1` on rebuild), and rebuilds reset hover/arm state to never point at stale data — the `dimmed()/refs[i]` TypeError class is closed by construction.
-- Label engine keeps state in preallocated typed arrays (collision quads, order); `measureText` and `rgb()` strings are cached. Dragging, zooming, hovering allocate nothing per frame; DPR is capped at 2.
-- Treemap geometry: WebGL2 instanced tiles (12 floats each) + a 2D label layer; WebGL2 mount failure degrades the app to the honest map-state bed (`getChildren` failures print the real reason on a dots bed).
+- The treemap bed is `t.bg`; the Canvas and shader use the same palette.
+- Nested fills move 8% per depth toward the raised surface, capped at 24%.
+- Parent outlines use `t.category_line(cat)` at 1 px; selection uses a 1.5 px
+  accent outline with a 1 px offset.
+- Neutral hover uses `surface_hover`; pressed uses `surface_pressed`.
+- Category hatching is information: Caches and the aggregate tail carry a
+  diagonal pattern, so category identity is never color-only.
+- The low-level `t.dark` alias remains only where older call sites need it; new
+  code reads `t.is_dark`.
 
-## A11y & keyboard
+### Verification
 
-Tab reaches every control; rails/toggles are real `<button>`s (`aria-pressed` on category toggles, segmentation via `role="tablist"`). Explorer keys: Backspace up a level, Alt+←/→ history, `+/−` zoom, `Ctrl 0` refit, `Ctrl F` focus filter, `Ctrl K` palette, Enter / Ctrl C act on selection (the context menu promises those keycaps — they are wired). The palette (`Ctrl/Meta+K`) filters commands and, with a query, jumps to files/folders with real sizes; ↑/↓/Enter/Escape. Hover cards are `role="status"` with **`aria-live="off"` on purpose**: pointer-driven readouts must not flood the accessibility tree — keyboard parity comes from focus-opening the same card.
-
-## Do's and Don'ts
-
-- **Do** treat `.panel`/`.float` as the whole surface vocabulary; interiors are hairlines, never nested cards.
-- **Do** keep every live figure `.num` (tabular mono) and every label sentence-case Geist.
-- **Do** gate new saturated color: the treemap palette, accent, warn and danger are the entire budget.
-- **Don't** use gradients, glass/blur, glowing ambient, or blinking dots (the scan meter sweeps cleanly instead).
-- **Don't** letterbox the treemap (impossible) or overlap tile labels (largest-first ladder + focus priority forbids it).
-- **Don't** add a delete/move/rename affordance — read-only is structural (`capabilities/default.json` allows only reveal-in-dir and open-path).
-- **Don't** reintroduce a logo tile: the wordmark is lowercase Geist type, small, like this build.
-
-Last verified: 2026-10-19 · `space` 0.1.0 · checked against the working tree (no git history in this folder).
+`cargo test --all-targets` is the gate. Unit tests in `theme.rs` assert AA
+contrast for text and categories, that both dark flags agree, and that the
+motion curve is bounded and monotonic. Contrast figures above are calculated
+from the tokens, not sampled from a screenshot. Screenshot review is recorded in
+`docs/QA.md`.

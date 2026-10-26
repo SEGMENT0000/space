@@ -1,0 +1,69 @@
+[package]
+name = "space"
+version = "0.2.0"
+edition = "2024"
+description = "A read-only, local-first disk space analyzer"
+license = "MIT"
+default-run = "space"
+
+[lib]
+name = "space"
+path = "src/lib.rs"
+
+[[bin]]
+name = "space"
+path = "src/main.rs"
+
+[[bin]]
+name = "space-bench"
+path = "src/bin/space-bench.rs"
+
+[dependencies]
+iced = { version = "0.14.0", default-features = false, features = [
+    "wgpu",
+    "canvas",
+    "image",
+    "svg",
+    "advanced",
+    "crisp",
+    "thread-pool",
+    "smol",
+] }
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+    "tiff",
+    "ico",
+] }
+sysinfo = "0.33"
+parking_lot = "0.12"
+rayon = "1.12"
+crossbeam-channel = "0.5"
+rfd = "0.15"
+zip = "2.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+jwalk = "0.8"
+dashmap = "6"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "unwind"
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true

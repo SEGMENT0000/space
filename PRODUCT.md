@@ -4,84 +4,214 @@
 
 ## Platform
 
-Desktop app for Windows on Tauri v2: a Rust shell (drive queries, scanner, previews, opener bridge) embedding a React 19 + TypeScript + Vite front end (`space/src/`, `space/src-tauri/`). The window opens 1320×860 (min 1024×680, centered, drag-drop enabled, dark by default — `tauri.conf.json`). Build chain: `npm run build` is `tsc && vite build` → `dist/`, which the shell embeds via `frontendDist: "../dist"`. **The release binary must be built through the Tauri CLI (`npx tauri build --no-bundle`) — verified 16:13 after a live defect:** a manual `cargo build --release` keeps `build.devUrl` active and embeds nothing; the exe silently serves a leftover `vite` dev server if one is alive (unminified modules, stale HMR state — it shipped a `TABLE_ROW_CAP is not defined` toast from an edit race). Verify the real embed by launching with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222` and reading `127.0.0.1:9222/json/list`: the page URL must be `http://tauri.localhost/`, never `localhost:1420`. Version 0.1.0 in both `package.json` and `tauri.conf.json`. Measured bundle on disk: `dist/assets/index-DnrLeGbX.js` 389,364 B (≈389 KB; 125,265 B gzipped ≈126 KB), one 37,647 B CSS output, plus the two font files. Styles are handwritten CSS (`src/styles/` tokens + primitives + per-screen modules, imported through `src/index.css`); no CSS framework ships.
+adaptive
 
-Fonts: Geist + Geist Mono, variable, self-hosted from `src/fonts/` as `Geist-Variable.woff2` (69,492 B) and `GeistMono-Variable.woff2` (71,236 B). One family pair for everything: Geist for labels and body text, Geist Mono for tabular figures, paths, and keycaps. The banned families (Inter, Roboto, Arial, Open Sans, Helvetica) appear nowhere.
+This build ships as a native Windows desktop application in pure Rust. Iced 0.14
+owns the application shell, input, focus and accessibility tree; the treemap
+fills are drawn through Iced's WGPU renderer from live filesystem data. There is
+no web runtime, no Tauri, no React and no IPC boundary. One UI binary,
+`space.exe`, built by `cargo build --release`; `space-bench` is a separate
+headless diagnostic binary.
+
+Source layout:
+
+- `src/engine/` — read-only walker, classification, volume listing.
+- `src/preview/` — bounded previews; text, hex, image, list, meta, SQLite, media.
+- `src/treemap/` — pure squarify, camera, hit-test and label geometry.
+- `src/render/` — instanced WGPU fill pipeline.
+- `src/ui/` — shell, screens, inspector, overlays and design tokens.
+- `DESIGN.md` — visual specification and theme tokens.
+- `docs/` — architecture, contracts, QA and measured benchmarks.
+
+The window opens at 1320×860 logical pixels with a minimum of 1024×680 and is
+freely resizable. Windows 10/11 is the verified target. The portable walker and
+platform-specific paths exist for macOS/Linux, but those platforms have not been
+run and are not claimed as verified.
+
+Fonts: Geist and Geist Mono static TTFs are bundled in `assets/fonts/` with
+their OFL license. Geist carries labels and body text; Geist Mono carries
+tabular figures, paths and keycaps. The banned families (Inter, Roboto, Arial,
+Open Sans, Helvetica) are neither bundled nor referenced.
+
+Read-only is structural. The scanner only enumerates directories and reads
+metadata; previews only open files for bounded reads. No write, rename, delete,
+cleanup or move API is linked into the production engine. Opening or revealing
+a path is an explicit user action handed to the OS shell, never a preview.
 
 ## Users
 
-The author, a technical desktop user who judges interface craft at pixel level and drives tools keyboard-first. They intend to ship `space` later, so the bar is product-grade, not a personal prototype. No external audience has been confirmed yet.
+A technical desktop user who judges interface craft at pixel level and works
+keyboard-first. The app is intended to ship, so the bar is product-grade rather
+than a prototype. No external audience has been confirmed.
 
 ## Product Purpose
 
-`space` shows what is eating disk space on a Windows machine: it scans a volume, a folder dropped onto the window, or a volume passed as `?scan=<path>`, and renders the result as an interactive two-level treemap you drill into. Success means the user identifies the files consuming space within seconds, reads the proportions correctly at a glance, and never has to trust the app with their data: storage is shown as an instrument, not a checklist to clean.
+`space` shows what is consuming storage on a Windows machine. It scans a volume,
+a folder chosen in the OS picker, a folder dropped on the window, a CLI path, or
+`SPACE_SCAN=<path>`, then renders the result as a progressive hierarchical
+treemap. Success means the user finds the large consumers within seconds, reads
+proportions correctly at a glance, and never has to trust the app with their
+data: storage is presented as an instrument, not a cleanup checklist.
 
 ## Positioning
 
-A read-only, local-first disk analyzer whose treemap *is* the product: a WebGL-rendered, zoom-navigable two-level layout with category semantics, no cloud, no telemetry, and no delete path anywhere in the codebase. The neighbouring tool could not truthfully copy the claim "read-only by construction — it is structurally incapable of modifying what you point it at."
+A read-only, local-first disk analyzer whose treemap is the product: native
+WGPU rendering, recursive drill-down over real hierarchy, fixed category
+semantics, no cloud, no telemetry, and no delete path anywhere in the codebase.
+The claim is structural rather than a promise in marketing copy.
 
 ## Operating Context
 
-A desktop window containing the web UI. Three screens route through `App.tsx` (drives → scan → explorer) after a rendered boot state (lowercase wordmark + one honest line, no spinner); the window resizes freely and the layout holds at every size:
+A native desktop window with three screens and a persistent application bar:
 
-- **Drives ledger** — one panel listing volumes as a narrative instrument: a statement claim above the panel ("Every volume has headroom" / "C: is 88% used" / "N volumes are running low"), Σ context lines, and per-row two-line readouts (fig1 "X used", fig2 "Y free · Z total"). The 10px tick-gridded ribbon warns past 80% (`low`, amber word printed inline) and goes danger past 92% (`critical`, diagonal hatch on the fill); a legend decodes the ribbon at the panel foot. One quiet Scan action per row — transparent at rest, revealed on row hover/focus, never accent-filled — carries the row's math as its `aria-label`; the row click is a mouse convenience. Rows carry no rules; tiny used shares print honestly ("<0.1%"). The wordmark sits above the panel and the footer repeats: "Read-only · nothing on disk is ever modified."
-- **Scan meter** — a centered 620px instrument that is deliberately honest: an indeterminate accent sweep (no percentage — the scanner reports no total), a four-counter band (bytes / files / dirs / skipped), a 90-bar rate strip of observed deltas, and the walking path at the foot. Failure swaps the meter for a danger band with the engine's message verbatim and selectable, and Cancel becomes "Back to volumes."
-- **Explorer** — topbar (back/forward, breadcrumbs that ellipsize at 220px and collapse past 5, a 200→240px filter field, Size/Name/Type sort, a `Ctrl K` hint, rail toggle) over a full-bleed treemap panel, a fixed 300px inspector rail (selection readout, category composition with on/off legend, Largest files), and a statusbar (Items / Files / Size / Of-volume figures; when filters hide categories, a hatched chip names the count and clicking it unhides all at once). Directory tiles never show listing plates — a folder's interior is its nested treemap, drilled and zoomed, and it subdivides lazily on demand inside its own tile (large folders become their real contents instead of flat tints); preview plates (text/hex/image/meta, archive & table listings) belong to file tiles at any depth. Hover identity always matches the pixels under the pointer — including under plates. A click on a directory tile drills exactly one level; Escape clears the filter box.
-- **Hover card** — the app's one readout for tiles and rows: name, mono size + share, category chip, count, full path, and the real actions; follows the pointer between identity changes without re-rendering React.
-- **Context menu** — Open file/folder · Reveal in Explorer · Copy path, with the keycap hints the key map actually honors (Ctrl C copies, Enter acts).
-- **Command palette** — `Ctrl/Meta+K` filters commands and, with a query, jumps to files/folders by name with real sizes.
-- **Deep links** — `?scan=<path>` boots straight into a scan, gated to `/^[A-Za-z]:\\/`; `?theme=light|dark`, `?screen=`, and `?zoom=` serve the review harness.
+- **Drives** — mounted volumes with capacity, used, free and utilization; a
+  measured utilization ribbon; one quiet Scan action per volume; a folder picker;
+  and a plain read-only statement.
+- **Scan** — a live instrument for a real traversal: files, folders, bytes,
+  skipped entries, observed throughput bars, elapsed time, the directory being
+  read and a working Cancel action. A cancelled scan returns to the volume list
+  with a toast. A failed scan shows the engine's message verbatim (or a generic
+  failure explanation) with recovery actions.
+- **Explorer** — a top bar with navigation history and breadcrumbs, a recursive
+  filter field, a Map/Composition segmented view, sort control, inspector rail
+  toggle and command palette. The treemap is the main surface; a five-figure
+  summary strip sits above it. The inspector rail holds selection identity,
+  category, size/share, path, previews, exact composition and largest files.
+  The status bar reports items or matches, files, bytes, zoom and elapsed time.
+- **Overlays** — a command palette for commands and scanned files, a context
+  menu (Open, Show in parent folder, Copy path), drag-hover target, and short
+  toasts. Each is dismissed by Escape or a click outside where appropriate.
+
+The map has two modes. **Map** shows the current folder as a nested treemap;
+directories can be drilled by double-click or Enter, the wheel zooms around the
+pointer, left-drag pans, and Backspace goes to the parent. **Composition** shows
+a ranked category breakdown for the scanned root with exact byte totals and a
+proportional bar. Filtering searches recursively within the current subtree and
+rebuilds the map around real matching ancestors.
 
 ## Capabilities and Constraints
 
-Confirmed scope — every capability is read-only; nothing deletes, moves, or writes files:
+Confirmed scope — every capability is read-only:
 
-- List mounted volumes with capacity, used, free, and utilization.
-- Scan a volume or dropped folder with live counters, a skipped ledger, cancel, and verbatim error reporting.
-- Treemap colored by the eight fixed categories, subdividing recursively on demand (lazily, capped at 5 interior levels); the legend toggles categories, and hidden tiles hold their place at 0.16 alpha.
-- In-tile content plates on large tiles: files (text/code, greyscale and scrubbed; a 4 KB hex head with signature highlight; decoded images; archive/table rows; metadata) and **leaf folders** (the real folder listing: size-sorted files, name-sorted directories, `folder · N entries`). Lazy, pooled 24 with a hard 24-plate visible ceiling, backend LRU 256 with 4 worker permits. A directory that renders an interior never plates, because its nested treemap is the preview; a directory with no interior (depth cap, cap-truncated tail, empty or unreadable expansion) gets a folder card instead of a dead fill.
-- Inspector rail: Contents list and Largest files; multi-select with byte totals; Copy path rides the clipboard (`navigator.clipboard.writeText`, demo-aware).
-- Light and dark appearance, persisted in `localStorage["space.theme"]`, overridable by deep link.
+- Enumerate mounted volumes with capacity, used, free and utilization.
+- Scan a volume, a picked folder, a dropped folder, a CLI path or an environment
+  path with live progress, truthful counters, throughput samples, error counts
+  and cancellation.
+- Render a progressive hierarchical treemap colored by eight fixed categories:
+  Media, Documents, Code, Caches, Apps, Archives, System, Other.
+- Recursive drill-down with accurate hit testing, wheel zoom, left-drag pan,
+  refit, history and breadcrumbs. Large folders render up to 63 real children
+  plus one hatched aggregate tail; every tail label reports the real remainder.
+- Adaptive, clipped, non-overlapping labels. Labels disappear before they can
+  overflow a tile; folder interiors win over header text when space is tight.
+- Category legend with hide/show toggles. Hidden categories leave the map and
+  status counts; they never render as fake ghost tiles.
+- Composition mode with exact category byte totals, percentages and file counts.
+- Sort the inspector's largest files by size or name.
+- Inspector previews: TEXT, HEX, IMAGE, LIST (folder/archive/table), META, DB
+  (read-only SQLite) and MEDIA metadata. Previews are bounded and never execute
+  or play content; media uses metadata plus an optional OS thumbnail.
+- Selection, hover identity, context menu, copy path, open and reveal.
+- Command palette with 11 commands and scanned-file search.
+- Light and dark themes, both first-class; `T` toggles when text focus is free.
+- Drag a folder onto the window to scan it.
+- Keyboard: Backspace parent, Alt+Left/Right history, +/− zoom, Ctrl+0 refit,
+  Ctrl+F or `/` filter, Ctrl+K palette, Enter open, Ctrl+C copy path, Escape
+  close/clear. Shortcuts do not fire while a text input is being edited, except
+  Escape, Ctrl+K, Ctrl+F and F12.
+- Deep-link equivalents: `SPACE_SCAN`, `SPACE_SCREEN=drives|scan|explorer`,
+  `SPACE_THEME=light|dark` and a CLI folder argument.
+- Internal review harness: `SPACE_SHOT_DIR` plus F12 saves the rendered client
+  area, including WGPU output. The shipping UI never takes screenshots on its
+  own.
 
-Binding constraints from the user:
+Binding constraints:
 
-- Banned type: Inter, Roboto, Arial, Open Sans, Helvetica. Real font files ship with the project and load locally.
-- Banned decoration: purple-to-blue or mesh gradients, glassmorphism, floating ambient background lights, uniform default box-shadows, card-grid-everywhere layouts, lorem-style filler, redundant subheadings that restate a section title, blinking or pulsing status dots, and any element whose only job is to look designed.
-- Interaction: the left mouse button must carry the primary drag gesture; middle-button-only drag is explicitly rejected.
-- The treemap must fill its container at the correct aspect ratio at every window size, and tile labels must never overlap or bleed outside their tile.
-- Synthetic data must be fully fictional (pinned by the user, 2026-10-17): demo content ships no real usernames, folder names, people, locations, timezones, email addresses, or phone numbers — ever. Personal data appears in the app only as live display of what the user's own scan returns, never baked into code. A purge-and-audit pass enforced this; regressions are release blockers.
-- Open decisions (owned by the design flow, not this file): ship name/licensing, and any first-run onboarding.
+- Banned type: Inter, Roboto, Arial, Open Sans, Helvetica.
+- Banned decoration: purple-to-blue or mesh gradients, glassmorphism, ambient
+  glows, uniform card shadows, generic card grids, lorem or placeholder content,
+  pulsing status dots, and decorative animation.
+- The treemap must fill its container at the correct aspect ratio at every
+  window size. Labels must never overlap, clip mid-word, or escape their tile.
+- Content must not overflow the inspector rail, palette, context menu, summary
+  strip or status bar at any tested size.
+- The left mouse button carries pan; no middle-button-only gesture.
+- Synthetic or demo scan data is not shipped. Personal paths appear only as the
+  live result of the user's own scan.
 
 ## Guarantees
 
-- **Read-only is structural.** The Tauri capability file grants exactly two opener permissions beyond defaults — `opener:allow-reveal-item-in-dir` and `opener:allow-open-path` (`src-tauri/capabilities/default.json`); there is no write, delete, or rename permission to grant, and previews read bytes without executing them.
-- **Keyboard parity.** Backspace up a level, Alt+←/→ history, `+`/`−` zoom, `Ctrl 0` refit, `Ctrl F` filter, `Ctrl K` palette, Enter/Ctrl C on selection; every icon-only button carries `title` + `aria-label`; pointer-only readouts have a focus path.
-- **Honest numbers.** No fabricated progress percentages and no placeholder figures: unknown values print dashes, warnings are real thresholds, and failure text is the engine's own message.
-- **Walker.** Windows enumerates via a direct FindFirstFileExW fast walker (UTF-16 name arena, zero-alloc staging, batched notify-gated queue, below-normal-priority thread, catch-unwind isolating bad paths); other platforms fall back to a parallel jwalk walk. Directory totals update O(1) against a 256-entry sorted cache.
-- **Speed.** From D: at rest, clicking Scan reaches a fully live explorer in ≤ 0.8 s warm (verified twice, `.impeccable/qa-next.md`). A cold C: scan (1.3M files) completes in ≈2 s (verified 15:54, embedded build). An earlier logged figure of 416 files / 8.32 GB carries `>?` — it cannot be reproduced from the repo today.
+- **Read-only is structural.** The engine links only directory enumeration and
+  metadata reads. Previews open files without write access and never execute
+  them. There is no delete, rename, move, clean or write UI action to wire up.
+- **Honest numbers.** Progress is indeterminate because the scanner cannot know
+  the final total in advance. Counters, sizes, error counts, throughput and
+  composition are measured; unknown values print as a dash. Failure text comes
+  from the engine, not a fabricated friendly substitute.
+- **Accurate geometry.** The same scene used for WGPU fills drives hit testing,
+  hover, selection, labels and the tail aggregate. Treemap unit tests cover
+  containment, overlap, camera inversion, zoom clamping and label safety.
+- **Bounded work.** The recursive filter is capped at 120,000 visits and 2,000
+  matches; treemap children are capped at 64 visible entries with the remainder
+  expressed as one aggregate tile; previews read bounded byte ranges and use a
+  bounded LRU cache with four heavy-work permits.
+- **Keyboard parity.** Every primary action has a key; text inputs keep their
+  own keys; the focus sink releases fields deterministically.
+- **Measured performance.** Cold and warm scans, throughput, memory, geometry,
+  navigation, previews and cancellation are recorded from real runs on a named
+  machine in `docs/BENCHMARKS.md`.
 
 ## Evidence on Hand
 
-- The built implementation is the evidence: `space/src/` (React 19 front end, WebGL2 treemap) and `space/src-tauri/` (Rust scanner and previews) compile today, type-checking enforced by `npm run build`; DESIGN.md and this file cite the code rather than argue.
-- Measurement convention: any figure above traces to a file on disk or a dated QA note; unverifiable claims carry `>?` instead of applause.
-- No stock photography, testimonials, customer names, or third-party proof exist. Future work must not fabricate any.
+- The built implementation is the evidence: `src/` compiles into a native
+  `space.exe`; the headless `space-bench` links the same engine.
+- The test suite covers engine totals, classification, cancellation, permission
+  failures, unusual entries, empty directories, preview safety, cache bounds,
+  treemap geometry and render draw lists. See `docs/QA.md`.
+- Screenshots are captured from the running binary through the internal F12
+  harness at 1024×680, 1320×860 and 1728×1080 in both themes. See `docs/QA.md`
+  for the checked states.
+- No stock photography, testimonials, customer names or third-party proof exist.
+  Future work must not fabricate any.
 
 ## Brand Commitments
 
-Name: `space`, set lowercase. The former orange "s" letter-tile badge is retired by user decision and must not return in any form; a mark, if any, must be meaningful to the subject (volume, blocks, proportion) or be absent entirely. Voice: plain and technical; no marketing language, no hype copy.
+Name: `space`, set lowercase. The former orange "s" letter-tile badge is retired
+and must not return in any form. A mark, if any, must be meaningful to the
+subject (volume, blocks, proportion) or be absent.
 
-**Standing aesthetic preference (pinned by the user, 2026-10-16):** the craft bar is Apple's system apps — Finder, Disk Utility, Photos. Every surface must read as pixel-perfect and smooth at that level: neutral slightly-cool surfaces in light and dark, one type family at real weight steps, hairline separators instead of cards or shadows, an 8pt spacing rhythm, tabular figures for all data, and a single unified motion curve for every transition. The user rejected skeuomorphic/costume visual worlds and rated generic "AI slop" UI 2/100. Borrow the craft discipline only — never Apple's chrome, icons, or copy. This is a standing preference for every future round.
+Voice: plain and technical. No marketing language, no hype, no cute empty-state
+copy. Numbers are exact, units are explicit, and failures say what happened.
+
+**Standing aesthetic preference:** the craft bar is Apple's system utilities —
+Finder, Disk Utility, Photos. Every surface must read as pixel-perfect and calm:
+warm paper neutrals in light mode and deep neutral green-charcoal in dark mode,
+one type family at real weight steps, hairline separators instead of cards and
+shadows, an 8-point spacing rhythm, tabular figures for data, and restrained
+motion. Borrow craft discipline only; never Apple chrome, icons or copy.
 
 ## Product Principles
 
 1. Read-only is structural, and the interface says so plainly.
-2. Proportion is the message: area encodes size, and chrome never competes with the data.
-3. Speed is a feature: instant feedback, keyboard-first operation, motion that never blocks.
-4. Nothing decorative without meaning: if an element carries no information or affordance, it is cut.
-5. Pixel-level craft is the acceptance bar; vague "looks modern" is not a pass.
+2. Proportion is the message: area encodes size and chrome never competes.
+3. Speed is a feature: instant feedback, keyboard-first operation, motion that
+   never blocks input.
+4. Nothing decorative without meaning: if an element carries no information or
+   affordance, cut it.
+5. Pixel-level craft is the acceptance bar; "looks modern" is not a pass.
 
 ## Accessibility & Inclusion
 
-No separate standard was set; the built baseline holds: visible focus (`:focus-visible` 2px `--focus` ring, 1px offset), keyboard operability for every action, 4.5:1 label contrast computed from the drawn fill (`inkFor()`), category information carried as label plus pattern (the Caches hatch, swatch dots) never color alone, real `<button>`s with `aria-pressed`, segmentation via `role="tablist"`, and `role="status"` hover cards kept intentionally flood-free (`aria-live="off"`, keyboard parity via focus). Both appearances resolve from the same tokens.
+The native baseline:
 
-Last verified: 2026-10-19 · `space` 0.1.0 · checked against the working tree (no git history in this folder).
+- Every interactive control is reachable by keyboard; text inputs are labelled
+  by their surrounding context and never trap global Escape.
+- Focus is visible through Iced's widget states and the sage accent.
+- Category identity is carried by label and pattern as well as color: Caches
+  and the tail aggregate use diagonal hatching; legends pair swatches with names.
+- Label ink is chosen from the drawn fill and contrast-tested in `theme.rs`.
+- Motion is short and non-blocking; there are no pulsing or blinking indicators.
+- Both appearances use the same semantic tokens, so contrast does not depend on
+  which theme happens to be active.
+
+Last verified: 2026-10-26 — `space` 0.2.0 — against the working tree.
