@@ -24,8 +24,10 @@ walk.
   `classify.rs`; enumeration and cancellation in `scan.rs`; volume listing in
   `mod.rs`. No UI or WGPU types are allowed here.
 - `src/preview/` - bounded, read-only preview builders for text, hex, image,
-  list/archive/office, metadata, SQLite and media. No execution, no shell, no
-  writes.
+  list/archive/office, metadata, SQLite and media. No execution or writes. The
+  in-process path makes no shell calls; the opt-in rich tile path asks Windows
+  for a thumbnail under the size, timeout and fallback rules in
+  `docs/CONTRACTS.md`.
 - `src/treemap/` - pure geometry: squarified layout, camera transform, hit
   testing and label fitting. No Iced or WGPU imports, so tests run headless.
 - `src/render/` - instanced WGPU fill pipeline exposed as an Iced shader widget.

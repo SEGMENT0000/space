@@ -9,7 +9,7 @@ use crate::preview::TextPreview;
 
 const TEXT_LINES: usize = 120;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextClass {
     Utf8,
     Utf16Le,
@@ -30,7 +30,14 @@ pub fn from_head(raw: &[u8], len: u64, is_svg: bool) -> Option<TextPreview> {
 
     let body: String = match class {
         TextClass::Utf8 => {
-            let start = usize::from(raw.starts_with(&[0xEF, 0xBB, 0xBF]));
+            // A UTF-8 BOM is three bytes. Skipping one leaves EF BB in the
+            // decoded body, which renders as replacement glyphs before the
+            // first real character.
+            let start = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                3
+            } else {
+                0
+            };
             String::from_utf8_lossy(&raw[start..]).into_owned()
         }
         TextClass::Utf16Le => {
@@ -305,4 +312,65 @@ fn is_attr_name_start(b: u8) -> bool {
 
 fn is_attr_name(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b':'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(raw: &[u8], is_svg: bool) -> Vec<String> {
+        from_head(raw, raw.len() as u64, is_svg)
+            .expect("text preview")
+            .lines
+    }
+
+    #[test]
+    fn utf8_bom_is_removed_as_three_bytes() {
+        let raw = b"\xEF\xBB\xBF# QA\n\nA BOM-prefixed markdown file.";
+        let lines = lines(raw, false);
+        assert_eq!(lines.first().map(String::as_str), Some("# QA"));
+        assert_eq!(lines.get(1).map(String::as_str), Some(""));
+        assert!(
+            lines.iter().all(|line| !line.contains('\u{FEFF}')),
+            "the BOM must not survive into the first logical line"
+        );
+        assert_eq!(
+            from_head(raw, raw.len() as u64, false)
+                .and_then(|preview| preview.encoding)
+                .as_deref(),
+            Some("utf-8")
+        );
+    }
+
+    #[test]
+    fn utf16_boms_decode_in_both_byte_orders() {
+        let text = "# QA\r\nGeist Mono\r\n";
+        let mut le = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            le.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut be = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            be.extend_from_slice(&unit.to_be_bytes());
+        }
+        assert_eq!(lines(&le, false).first().map(String::as_str), Some("# QA"));
+        assert_eq!(lines(&be, false).first().map(String::as_str), Some("# QA"));
+    }
+
+    #[test]
+    fn binary_heads_are_rejected_without_a_lossy_preview() {
+        let raw = [0x00, 0x01, 0x02, 0x00, 0xFF, 0x10, 0x00, 0x80];
+        assert_eq!(classify_text(&raw), TextClass::Binary);
+        assert!(from_head(&raw, raw.len() as u64, false).is_none());
+    }
+
+    #[test]
+    fn svg_sanitizing_still_applies_after_decoding() {
+        let raw = b"\xEF\xBB\xBF<svg><script>alert(1)</script><rect onclick=\"x\"/></svg>";
+        let preview = from_head(raw, raw.len() as u64, true).expect("svg source");
+        let body = preview.lines.join("\n");
+        assert!(!body.contains("<script"));
+        assert!(!body.contains("onclick"));
+        assert!(body.contains("<rect"));
+    }
 }

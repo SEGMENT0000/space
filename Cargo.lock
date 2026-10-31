@@ -3822,9 +3822,12 @@ dependencies = [
  "jwalk",
  "parking_lot",
  "rayon",
+ "resvg",
  "rfd",
  "rusqlite",
  "sysinfo",
+ "tiny-skia",
+ "usvg",
  "windows-sys 0.61.2",
  "zip",
 ]

@@ -155,8 +155,8 @@ pub const TREEMAP_HIDDEN_TINT: f32 = 0.84;
 /// Parent-group outlines are category ink interpolated toward the fill.
 /// They are stronger than a hairline but thinner than a selected tile border.
 pub const TREEMAP_PARENT_LINE_WIDTH: f32 = 1.5;
-pub const TREEMAP_PARENT_LINE_MIX_LIGHT: f32 = 0.42;
-pub const TREEMAP_PARENT_LINE_MIX_DARK: f32 = 0.30;
+pub const TREEMAP_PARENT_LINE_MIX_LIGHT: f32 = 0.74;
+pub const TREEMAP_PARENT_LINE_MIX_DARK: f32 = 0.74;
 
 // ---------------------------------------------------------------------------
 // Motion
@@ -382,24 +382,24 @@ impl Theme {
             shadow: Color::from_rgba(0.0, 0.0, 0.0, 0.55),
 
             category_fill: [
-                color!(0x5D3B34), // Media
-                color!(0x534A2D), // Documents
-                color!(0x384127), // Code
-                color!(0x21474F), // Caches
-                color!(0x3D3E59), // Apps
-                color!(0x513849), // Archives
-                color!(0x33393E), // System
-                color!(0x4A4238), // Other
+                color!(0x69463B), // Media — terracotta
+                color!(0x62552F), // Documents — amber
+                color!(0x2F5340), // Code — green, without an olive cast
+                color!(0x24545D), // Caches — cyan
+                color!(0x484666), // Apps — lilac
+                color!(0x634252), // Archives — rose
+                color!(0x3A4A59), // System — slate blue
+                color!(0x484540), // Other — neutral stone
             ],
             category_soft: [
-                color!(0x46302A),
-                color!(0x403A26),
-                color!(0x2D3421),
-                color!(0x1C383D),
-                color!(0x303244),
-                color!(0x3E2E39),
-                color!(0x292E31),
-                color!(0x39342D),
+                color!(0x443029),
+                color!(0x443B25),
+                color!(0x243D30),
+                color!(0x1A3D43),
+                color!(0x34324B),
+                color!(0x462F3C),
+                color!(0x293642),
+                color!(0x33322F),
             ],
             category_ink: [
                 color!(0xF1D5C9),

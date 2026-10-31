@@ -261,10 +261,10 @@ fn classification_table_covers_context_rules() {
     let cases: &[(&str, &str, bool, Category)] = &[
         ("kernel32.dll", r"C:\Windows\System32", false, System),
         ("driver.sys", r"C:\Windows\System32\drivers", false, System),
-        ("foo.exe", r"C:\Windows", false, System),
+        ("foo.exe", r"C:\Windows", false, Apps),
         ("setup.exe", r"C:\Program Files\Foo", false, Apps),
         ("app.dll", r"C:\Program Files\Foo", false, Apps),
-        ("generated.dll", r"C:\proj\node_modules\pkg", false, Code),
+        ("generated.dll", r"C:\proj\node_modules\pkg", false, Apps),
         ("cached.bin", r"C:\Windows\Temp", false, System),
         ("setup.dmg", r"D:\Downloads", false, Archives),
         (
@@ -333,6 +333,117 @@ fn classification_table_covers_context_rules() {
         if !*is_dir {
             assert_eq!(classify_file(name, Path::new(parent)), *expected);
         }
+    }
+}
+
+#[test]
+fn known_extensions_win_over_folder_context() {
+    use Category::*;
+    let files = [
+        ("photo.JPG", Media),
+        ("notes.txt", Documents),
+        ("readme.MD", Documents),
+        ("main.rs", Code),
+        ("libspace.rmeta", Code),
+        ("compiler.o", Code),
+        ("compiler.OBJ", Code),
+        ("compiler.lib", Code),
+        ("setup.exe", Apps),
+        ("package.crate", Archives),
+        ("bundle.zip", Archives),
+        ("stale.tmp", Caches),
+        ("driver.sys", System),
+    ];
+    for parent in [
+        r"C:\project\target\debug",
+        r"C:\project\node_modules\package",
+        r"C:\Users\u\.cargo\registry",
+        r"C:\Users\u\AppData\Local\Temp",
+        r"C:\Program Files\App",
+        r"C:\Windows\System32",
+    ] {
+        for (name, expected) in files {
+            assert_eq!(
+                classify_file(name, Path::new(parent)),
+                expected,
+                "{parent} / {name}"
+            );
+        }
+    }
+    for name in ["artifact", "artifact.unknown", "artifact.扩展名"] {
+        for parent in [
+            r"C:\project\target",
+            r"C:\project\node_modules",
+            r"C:\Users\u\.cargo",
+        ] {
+            assert_eq!(classify_file(name, Path::new(parent)), Code);
+        }
+        assert_eq!(classify_file(name, Path::new(r"D:\misc")), Other);
+    }
+    assert_eq!(
+        classify_entry("photos.jpg", Path::new(r"D:\misc"), true),
+        Other
+    );
+}
+
+#[test]
+fn dlls_are_system_only_inside_the_windows_tree() {
+    for parent in [
+        r"C:\Windows",
+        r"c:\wInDoWs\Temp",
+        r"\\?\C:\Windows\System32",
+        r"\\server\share\Windows\System32",
+        r"\\?\UNC\server\share\Windows\System32",
+    ] {
+        assert_eq!(
+            classify_file("library.DLL", Path::new(parent)),
+            Category::System,
+            "{parent}"
+        );
+    }
+    for parent in [
+        r"D:\misc",
+        r"C:\project\target\debug",
+        r"C:\project\drivers",
+        r"C:\project\System32",
+        r"C:\project\Windows",
+        r"C:\WindowsApps\Package",
+        r"C:\ProgramData\App",
+    ] {
+        assert_eq!(
+            classify_file("library.dll", Path::new(parent)),
+            Category::Apps,
+            "{parent}"
+        );
+    }
+}
+
+#[test]
+fn scanner_preserves_file_types_inside_build_folders() {
+    let temp = TempDir::new("build-types");
+    let files = [
+        ("target/photo.png", Category::Media),
+        ("target/notes.txt", Category::Documents),
+        ("target/metadata.rmeta", Category::Code),
+        ("target/compiler.obj", Category::Code),
+        ("target/program.dll", Category::Apps),
+        ("node_modules/pkg/archive.zip", Category::Archives),
+        ("node_modules/pkg/license.md", Category::Documents),
+        (".cargo/registry/package.crate", Category::Archives),
+        (".cargo/registry/artifact.unrecognized", Category::Code),
+    ];
+    for (path, _) in files {
+        temp.write(path, b"12345678");
+    }
+    let output = scan(temp.path());
+    assert_reconciles(&output.tree, &output);
+    for (relative, expected) in files {
+        let path = temp.path().join(relative);
+        let id = (0..output.tree.len())
+            .map(|index| index as NodeId)
+            .find(|id| output.tree.path(*id) == path)
+            .expect("scanned file");
+        assert_eq!(output.tree.node(id).cat, expected, "{relative}");
     }
 }
 

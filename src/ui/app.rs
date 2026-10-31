@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use iced::keyboard::{self, key::Named};
 use iced::{Point, Size, Task, Vector, window};
+use parking_lot::Mutex;
 
 use crate::engine;
 use crate::model::{
@@ -19,6 +20,7 @@ use crate::treemap::Camera;
 
 use super::filter::FilterView;
 use super::fmt;
+use super::tile_art::TilePlanner;
 use super::{FILTER_INPUT, FOCUS_SINK, PALETTE_INPUT, platform};
 
 pub const RAIL_WIDTH: f32 = 318.0;
@@ -33,6 +35,31 @@ pub enum Screen {
     Drives,
     Scan,
     Explorer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NavigationAvailability {
+    pub can_back: bool,
+    pub can_forward: bool,
+    pub can_up: bool,
+}
+
+pub(crate) fn navigation_availability(
+    history_pos: usize,
+    history_len: usize,
+    current: NodeId,
+    root: NodeId,
+) -> NavigationAvailability {
+    let valid_position = history_len > 0 && history_pos < history_len;
+    NavigationAvailability {
+        can_back: valid_position && history_pos > 0,
+        can_forward: valid_position && history_pos.saturating_add(1) < history_len,
+        can_up: current != root,
+    }
+}
+
+fn mouse_history_enabled(screen: Screen, context_open: bool, palette_open: bool) -> bool {
+    screen == Screen::Explorer && !context_open && !palette_open
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +170,7 @@ pub enum Command {
     Back,
     Forward,
     PickFolder,
+    RichPreviews,
 }
 
 impl Command {
@@ -159,6 +187,7 @@ impl Command {
             Self::Back => "History back",
             Self::Forward => "History forward",
             Self::PickFolder => "Scan a folder…",
+            Self::RichPreviews => "Rich previews (uses Windows)",
         }
     }
 
@@ -258,6 +287,9 @@ pub struct App {
     pub sort: SortMode,
     pub mode: ExplorerMode,
     pub focus: Focus,
+    /// Opt-in Windows shell thumbnails. Off by default; toggled in Settings.
+    pub rich_previews: bool,
+    pub settings_open: bool,
     pub palette: PaletteState,
     pub palette_open: bool,
     /// Iced's text input owns Enter through `on_submit`, but raw key delivery
@@ -266,6 +298,9 @@ pub struct App {
     /// opening the file a palette jump just selected.
     enter_guard_until: Option<Instant>,
     pub context: Option<ContextMenu>,
+    /// Breadcrumb overflow menu: hidden ancestors between the scan root and
+    /// the last two visible crumbs.
+    pub crumbs_open: bool,
     pub preview: Option<Preview>,
     pub preview_for: Option<NodeId>,
     pub preview_loading: bool,
@@ -284,6 +319,11 @@ pub struct App {
     pub inspector_open: bool,
     pub window_size: Size,
     pub map_size: Size,
+    /// Async on-tile art: bounded background thumbnails/snippets/folder
+    /// summaries for visible Large tiles.
+    pub tiles: TilePlanner,
+    /// Actual map draw bounds, written by the canvas each frame.
+    pub tile_report: Arc<Mutex<Option<Size>>>,
     pub last_scan_label: Option<String>,
     pub now: Instant,
     pub frame_log: bool,
@@ -315,11 +355,16 @@ pub enum Message {
     GoUp,
     Back,
     Forward,
+    MouseHistoryBack,
+    MouseHistoryForward,
     Refit,
     Zoom(f32, Point, Size),
     Pan(Vector, Size),
     Context(NodeId, Point),
     CloseContext,
+    /// Toggle the breadcrumb overflow menu (hidden ancestor folders).
+    ToggleCrumbMenu,
+    CloseCrumbMenu,
     Command(Command),
     FilterChanged(String),
     FocusFilter,
@@ -336,6 +381,9 @@ pub enum Message {
     PaletteChoose(usize),
     PaletteAccept,
     ThemeToggle,
+    ToggleSettings,
+    CloseSettings,
+    ToggleRichPreviews,
     CopyPath,
     OpenSelected,
     RevealSelected,
@@ -367,6 +415,12 @@ impl App {
         let dark = std::env::var(crate::THEME_ENV)
             .map(|v| v.eq_ignore_ascii_case("dark"))
             .unwrap_or(false);
+        // Opt-in only. A developer env override exists for screenshot harnesses
+        // and manual verification; the UI starts with the setting off.
+        let rich_previews = std::env::var_os("SPACE_RICH_PREVIEWS").is_some_and(|value| {
+            let value = value.to_string_lossy();
+            !value.is_empty() && value != "0"
+        });
         let mut app = Self {
             screen: Screen::Drives,
             dark,
@@ -386,10 +440,13 @@ impl App {
             sort: SortMode::Size,
             mode: ExplorerMode::Map,
             focus: Focus::None,
+            rich_previews,
+            settings_open: false,
             palette: PaletteState::default(),
             palette_open: false,
             enter_guard_until: None,
             context: None,
+            crumbs_open: false,
             preview: None,
             preview_for: None,
             preview_loading: false,
@@ -405,9 +462,11 @@ impl App {
             comp_rx,
             toast: None,
             drag_hover: false,
-            inspector_open: true,
+            inspector_open: false,
             window_size: Size::new(1320.0, 860.0),
             map_size: Size::new(900.0, 500.0),
+            tiles: TilePlanner::new(),
+            tile_report: Arc::new(Mutex::new(None)),
             last_scan_label: None,
             now: Instant::now(),
             frame_log: std::env::var_os("SPACE_FRAME_LOG").is_some_and(|value| {
@@ -419,6 +478,7 @@ impl App {
             shot_dir: std::env::var_os("SPACE_SHOT_DIR").map(PathBuf::from),
             shot_seq: 0,
         };
+        app.tiles.set_rich(rich_previews);
 
         let target = deep_link_target();
         let requested_screen = std::env::var(crate::SCREEN_ENV)
@@ -559,6 +619,7 @@ impl App {
         self.palette_open = false;
         self.context = None;
         self.mode = ExplorerMode::Map;
+        self.tiles.reset();
         self.last_scan_label = Some(summary.root_path.clone());
         self.screen = Screen::Explorer;
         self.focus = Focus::None;
@@ -594,6 +655,8 @@ impl App {
         self.preview_for = None;
         self.preview_loading = false;
         self.context = None;
+        self.crumbs_open = false;
+        self.tiles.bump();
         self.rebuild_filter();
         self.load_composition();
     }
@@ -742,6 +805,7 @@ impl App {
             Command::CopyPath,
             Command::Open,
             Command::Reveal,
+            Command::RichPreviews,
         ];
         let q = self.palette.query.trim().to_lowercase();
         self.palette.commands = commands
@@ -863,6 +927,13 @@ impl App {
                 let id = self.focus_node();
                 self.reveal(id)
             }
+            Command::RichPreviews => {
+                self.settings_open = !self.settings_open;
+                self.context = None;
+                self.crumbs_open = false;
+                self.palette_open = false;
+                Task::none()
+            }
         }
     }
 
@@ -936,7 +1007,28 @@ impl App {
         {
             self.toast = None;
         }
+        self.drive_tiles();
         Task::none()
+    }
+
+    /// Drain finished tile-art jobs and request work for visible Large tiles.
+    /// Runs on the UI thread but performs no disk or decode work itself.
+    fn drive_tiles(&mut self) {
+        if self.screen != Screen::Explorer || self.mode != ExplorerMode::Map {
+            return;
+        }
+        let Some(output) = self.output.clone() else {
+            return;
+        };
+        let bounds = *self.tile_report.lock();
+        self.tiles.update(
+            &output,
+            self.current,
+            bounds,
+            self.camera,
+            self.filter.hidden,
+            self.filter_view.clone(),
+        );
     }
 
     fn handle_key(&mut self, event: keyboard::Event, captured: bool) -> Task<Message> {
@@ -968,6 +1060,7 @@ impl App {
         if command && matches!(key, keyboard::Key::Character("f")) {
             if self.screen == Screen::Explorer {
                 self.palette_open = false;
+                self.settings_open = false;
                 return self.set_focus(Focus::Filter);
             }
             return Task::none();
@@ -1016,6 +1109,10 @@ impl App {
                     self.toast = None;
                 } else if self.context.is_some() {
                     self.context = None;
+                } else if self.crumbs_open {
+                    self.crumbs_open = false;
+                } else if self.settings_open {
+                    self.settings_open = false;
                 } else if self.filter.active() {
                     self.filter.clear();
                     self.filter_view = None;
@@ -1130,6 +1227,8 @@ impl App {
     fn toggle_palette(&mut self) -> Task<Message> {
         self.palette_open = !self.palette_open;
         self.context = None;
+        self.crumbs_open = false;
+        self.settings_open = false;
         if self.palette_open {
             self.palette.query.clear();
             self.palette.index = 0;
@@ -1217,7 +1316,9 @@ impl App {
                 }
                 self.screen = screen;
                 self.context = None;
+                self.crumbs_open = false;
                 self.palette_open = false;
+                self.settings_open = false;
                 self.set_focus(Focus::None)
             }
             Message::StartScan(path) => {
@@ -1285,14 +1386,30 @@ impl App {
                 self.forward();
                 Task::none()
             }
+            Message::MouseHistoryBack => {
+                if mouse_history_enabled(self.screen, self.context.is_some(), self.palette_open) {
+                    self.back();
+                }
+                Task::none()
+            }
+            Message::MouseHistoryForward => {
+                if mouse_history_enabled(self.screen, self.context.is_some(), self.palette_open) {
+                    self.forward();
+                }
+                Task::none()
+            }
             Message::Refit => {
                 self.camera = Camera::default();
                 Task::none()
             }
             Message::Zoom(factor, anchor, size) => {
                 self.map_size = size;
-                self.camera
-                    .zoom_at(factor, (anchor.x, anchor.y), super::rect_for(size), 12.0);
+                self.camera.zoom_at(
+                    factor,
+                    (anchor.x, anchor.y),
+                    super::rect_for(size),
+                    crate::treemap::MAX_SCALE,
+                );
                 Task::none()
             }
             Message::Pan(delta, size) => {
@@ -1303,10 +1420,24 @@ impl App {
             Message::Context(node, at) => {
                 self.selection = Some(node);
                 self.context = Some(ContextMenu { node, at });
+                self.crumbs_open = false;
                 self.set_focus(Focus::None)
             }
             Message::CloseContext => {
                 self.context = None;
+                Task::none()
+            }
+            Message::ToggleCrumbMenu => {
+                let collapsed = self
+                    .tree()
+                    .map(|tree| tree.lineage(self.current).len() > 4)
+                    .unwrap_or(false);
+                self.crumbs_open = collapsed && !self.crumbs_open;
+                self.context = None;
+                Task::none()
+            }
+            Message::CloseCrumbMenu => {
+                self.crumbs_open = false;
                 Task::none()
             }
             Message::Command(cmd) => self.command(cmd),
@@ -1314,6 +1445,7 @@ impl App {
                 self.filter.query = query;
                 self.palette_open = false;
                 self.rebuild_filter();
+                self.tiles.bump();
                 Task::none()
             }
             Message::FocusFilter => {
@@ -1327,11 +1459,13 @@ impl App {
             Message::ToggleCategory(cat) => {
                 self.filter.hidden[cat.id() as usize] = !self.filter.hidden[cat.id() as usize];
                 self.rebuild_filter();
+                self.tiles.bump();
                 Task::none()
             }
             Message::ClearFilters => {
                 self.filter.clear();
                 self.filter_view = None;
+                self.tiles.bump();
                 Task::none()
             }
             Message::ToggleSort => {
@@ -1340,6 +1474,7 @@ impl App {
             }
             Message::SetMode(mode) => {
                 self.mode = mode;
+                self.tiles.bump();
                 Task::none()
             }
             Message::ToggleRail => {
@@ -1375,6 +1510,32 @@ impl App {
             Message::PaletteAccept => self.accept_palette(),
             Message::ThemeToggle => {
                 self.dark = !self.dark;
+                Task::none()
+            }
+            Message::ToggleSettings => {
+                self.settings_open = !self.settings_open;
+                self.context = None;
+                self.crumbs_open = false;
+                self.palette_open = false;
+                Task::none()
+            }
+            Message::CloseSettings => {
+                self.settings_open = false;
+                Task::none()
+            }
+            Message::ToggleRichPreviews => {
+                self.rich_previews = !self.rich_previews;
+                self.tiles.set_rich(self.rich_previews);
+                let text = if self.rich_previews {
+                    "Rich previews on: Windows thumbnails may take a moment"
+                } else {
+                    "Rich previews off: in-process previews only"
+                };
+                self.toast = Some(Toast {
+                    text: text.into(),
+                    kind: ToastKind::Info,
+                    until: Instant::now() + Duration::from_secs(3),
+                });
                 Task::none()
             }
             Message::CopyPath => self.copy_path(),
@@ -1417,6 +1578,8 @@ impl App {
             Message::CloseOverlays => {
                 self.palette_open = false;
                 self.context = None;
+                self.crumbs_open = false;
+                self.settings_open = false;
                 self.set_focus(Focus::None)
             }
             Message::DismissScanError => {
@@ -1446,6 +1609,20 @@ impl App {
 
     pub fn subscription(&self) -> iced::Subscription<Message> {
         let tick_ms = if self.scan.is_some() { 60 } else { 220 };
+        let mouse_history =
+            if mouse_history_enabled(self.screen, self.context.is_some(), self.palette_open) {
+                iced::event::listen_raw(|event, _status, _window| match event {
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Back,
+                    )) => Some(Message::MouseHistoryBack),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Forward,
+                    )) => Some(Message::MouseHistoryForward),
+                    _ => None,
+                })
+            } else {
+                iced::Subscription::none()
+            };
         iced::Subscription::batch([
             iced::time::every(Duration::from_millis(tick_ms)).map(|_| Message::Tick),
             iced::window::events().map(|(id, event)| Message::WindowEvent { id, event }),
@@ -1462,6 +1639,7 @@ impl App {
                 }
                 _ => None,
             }),
+            mouse_history,
         ])
     }
 
@@ -1487,4 +1665,39 @@ fn deep_link_target() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::{Screen, mouse_history_enabled, navigation_availability};
+
+    #[test]
+    fn navigation_availability_tracks_history_and_root() {
+        let initial = navigation_availability(0, 1, 0, 0);
+        assert!(!initial.can_back);
+        assert!(!initial.can_forward);
+        assert!(!initial.can_up);
+
+        let at_end = navigation_availability(2, 3, 7, 0);
+        assert!(at_end.can_back);
+        assert!(!at_end.can_forward);
+        assert!(at_end.can_up);
+
+        let between = navigation_availability(1, 3, 4, 0);
+        assert!(between.can_back && between.can_forward && between.can_up);
+
+        let invalid_position = navigation_availability(4, 3, 0, 0);
+        assert!(!invalid_position.can_back);
+        assert!(!invalid_position.can_forward);
+        assert!(!invalid_position.can_up);
+    }
+
+    #[test]
+    fn mouse_history_is_only_active_in_unobscured_explorer() {
+        assert!(mouse_history_enabled(Screen::Explorer, false, false));
+        assert!(!mouse_history_enabled(Screen::Explorer, true, false));
+        assert!(!mouse_history_enabled(Screen::Explorer, false, true));
+        assert!(!mouse_history_enabled(Screen::Drives, false, false));
+        assert!(!mouse_history_enabled(Screen::Scan, false, false));
+    }
 }

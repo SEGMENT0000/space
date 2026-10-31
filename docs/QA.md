@@ -35,6 +35,28 @@ The release build produced both binaries in `target\release\`. A final rebuild i
 required after any source change; the screenshots in `docs/qa/` are from that
 release build, not from `cargo run` debug output.
 
+## Final gate revalidation — 2026-10-28
+
+The clean checkout was revalidated without source changes:
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| Formatting | `cargo fmt --check` | Pass |
+| Lints | `cargo clippy --all-targets --all-features -- -D warnings` | Pass, 0 warnings |
+| Tests | `cargo test --all-targets` | 94 passed, 0 failed, 0 ignored (24 library, 13 engine, 28 preview, 9 render, 20 treemap) |
+| Release build | `cargo build --release` | Pass, exit 0 |
+
+All 22 curated PNGs are present and every screenshot path referenced below
+resolves. The images were visually reviewed; in particular, `11-context-menu`
+is the light 1320x860 menu-open capture. These are the existing captures from
+the 2026-10-26 QA session, not new captures from this revalidation. No GUI input
+sequence was re-driven on 2026-10-28, so the Escape dismissal and other
+interaction observations below remain evidence from that earlier session.
+
+The requested old `Temp\\opencode\\denied` fixture was absent, and no
+`space.exe` process was running at the end of revalidation. The automated tests
+created and cleaned their own fixtures as part of the passing test run.
+
 ## Automated coverage
 
 `cargo test --all-targets` executes 94 tests:
@@ -213,7 +235,7 @@ not a portable guarantee.
 
 ```powershell
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 cargo build --release
 target\release\space-bench.exe "C:\" --runs 5

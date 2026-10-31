@@ -5,7 +5,7 @@ use iced::{Color, Element, Length};
 
 use super::Message;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Icon {
     Drive,
     Folder,
@@ -36,6 +36,13 @@ pub enum Icon {
     UpLeft,
     Clock,
     Shield,
+    Settings,
+}
+
+/// Raw bundled SVG source, used by the on-tile raster cache. The bytes are
+/// compile-time assets; nothing is fetched or executed.
+pub(crate) fn svg_source(icon: Icon) -> &'static [u8] {
+    bytes(icon)
 }
 
 fn bytes(icon: Icon) -> &'static [u8] {
@@ -69,6 +76,7 @@ fn bytes(icon: Icon) -> &'static [u8] {
         Icon::UpLeft => include_bytes!("../../assets/icons/corner-up-left.svg"),
         Icon::Clock => include_bytes!("../../assets/icons/clock.svg"),
         Icon::Shield => include_bytes!("../../assets/icons/shield.svg"),
+        Icon::Settings => include_bytes!("../../assets/icons/sliders-horizontal.svg"),
     }
 }
 

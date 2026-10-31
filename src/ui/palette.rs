@@ -403,5 +403,6 @@ fn command_icon(command: Command) -> Icon {
         Command::Back => Icon::ArrowLeft,
         Command::Forward => Icon::ArrowRight,
         Command::PickFolder => Icon::FolderOpen,
+        Command::RichPreviews => Icon::Settings,
     }
 }

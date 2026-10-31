@@ -92,14 +92,14 @@ Archives, System, Other.
 
 | Category | Light fill | Light ink | Dark fill | Dark ink |
 |---|---|---|---|---|
-| Media | `#F3C8B5` | `#5B392B` | `#5D3B34` | `#F1D5C9` |
-| Documents | `#EFE1B4` | `#594924` | `#534A2D` | `#EFE2BD` |
-| Code | `#CFE0C1` | `#36533A` | `#384127` | `#D6E8D3` |
-| Caches | `#B9E4E9` | `#2E4C55` | `#21474F` | `#CFE9EC` |
-| Apps | `#D6D6F0` | `#453F5F` | `#3D3E59` | `#DFDCF4` |
-| Archives | `#F2CEDC` | `#5D3A47` | `#513849` | `#F2D6E1` |
-| System | `#BBC6CE` | `#3C474F` | `#33393E` | `#DBE1E4` |
-| Other | `#DAD1C6` | `#4F493D` | `#4A4238` | `#E8E2D4` |
+| Media | `#F3C8B5` | `#5B392B` | `#69463B` | `#F1D5C9` |
+| Documents | `#EFE1B4` | `#594924` | `#62552F` | `#EFE2BD` |
+| Code | `#CFE0C1` | `#36533A` | `#2F5340` | `#D6E8D3` |
+| Caches | `#B9E4E9` | `#2E4C55` | `#24545D` | `#CFE9EC` |
+| Apps | `#D6D6F0` | `#453F5F` | `#484666` | `#DFDCF4` |
+| Archives | `#F2CEDC` | `#5D3A47` | `#634252` | `#F2D6E1` |
+| System | `#BBC6CE` | `#3C474F` | `#3A4A59` | `#DBE1E4` |
+| Other | `#DAD1C6` | `#4F493D` | `#484540` | `#E8E2D4` |
 
 Each category also has a `category_soft` wash for rows and chips. Fills are
 muted pastels in light mode and desaturated deep pastels in dark mode; hue
@@ -177,11 +177,15 @@ Panels and cards have no shadow. There is no “hover lift.”
    off-white (`#F5F6F5`), not warm cream or sepia; the dark bed is `#121514`.
 2. **Leaves.** Fill from `category_fill`. A 1 px gutter exposes the bed and
    keeps the map airy. Tiles use a 2 px radius, never pill shapes.
-3. **Nesting.** A group insets its children by 3 px. Depth is a subtle tint of
-   the category fill: 8% per level toward `surface_raised` in light mode or
-   toward `bg` in dark mode, capped at 24%. Do not jump hue families with depth.
-4. **Parent outlines.** Draw a 1.5 px `category_line` outline, derived by
-   interpolating category ink toward the fill (42% in light, 30% in dark).
+3. **Nesting.** Show one inner level at fit. Each 1.25x of camera zoom admits
+   one more level, and a folder only opens when its transformed tile is large
+   enough on screen (156x108 px); there is no fixed depth cap. Deeper folders
+   remain summary tiles until the camera opens them. Inner fills move 8% toward
+   `bg` without changing hue. Merge unreadably small siblings into one
+   proportional, hatched `N smaller items` tile, retaining at most 63 real
+   siblings.
+4. **Parent outlines.** Draw a 1 px `category_line` outline, derived by
+   interpolating category ink 74% toward the fill in either theme.
    This is containment, not a heavy border.
 5. **Hidden categories.** Blend 84% toward the bed. The tile should recede but
    remain discoverable; pair the treatment with the “hidden” label in the
@@ -190,9 +194,11 @@ Panels and cards have no shadow. There is no “hover lift.”
    or shadow.
 7. **Selection.** A 1.5 px `accent` outline plus a 1 px inner offset. Text stays
    `category_ink`; do not invert the tile to accent.
-8. **Labels.** Group headers use 11 px Geist Medium; leaf names use 12 px Geist
-   Medium when they fit. Sizes use Geist Mono. Clip with an ellipsis rather than
-   overflowing. If a label cannot fit, omit it — never draw 8 px type.
+8. **Labels.** Group headers and compact names use 12 px Geist; large leaf
+   names use 13 px. Snippets and metadata use 11 px. Size figures use 15, 22 or
+   28 px Geist Mono. Names, previews and figures occupy separate bands. Fit
+   with an ellipsis or omit a label before it overflows. Snippet continuation
+   is a solid ellipsis rather than a fade over the final line.
 9. **Chips and legends.** Solid swatch + label. The swatch carries the hue; the
    label stays neutral ink. Color is never the only encoding: the inspector,
    legend, and labels always name the category.
@@ -269,8 +275,8 @@ sampled from a screenshot.
 | `accent_ink` on `accent` | 6.04:1 | 8.06:1 |
 | `ink` on `selection` | 12.79:1 | 9.28:1 |
 | `danger` on `danger_soft` | 4.68:1 | 5.34:1 |
-| Category ink on fill (minimum) | 5.48:1 | 6.83:1 |
-| Category ink on soft (minimum) | 7.39:1 | 8.80:1 |
+| Category ink on fill (minimum) | 5.48:1 | 5.69:1 |
+| Category ink on soft (minimum) | 7.39:1 | 8.58:1 |
 | `hairline_strong` on `bg` (non-text) | 3.04:1 | 3.58:1 |
 
 - All primary, muted, faint, accent, semantic, and category text pairs meet
@@ -341,7 +347,7 @@ Fonts are registered once in `src/ui/mod.rs`. `FONT_UI` is `"Geist"` and
 ### Implementation notes
 
 - The treemap bed is `t.bg`; the Canvas and shader use the same palette.
-- Nested fills move 8% per depth toward the raised surface, capped at 24%.
+- Nested levels move 8% toward the bed in both themes.
 - Parent outlines use `t.category_line(cat)` at 1 px; selection uses a 1.5 px
   accent outline with a 1 px offset.
 - Neutral hover uses `surface_hover`; pressed uses `surface_pressed`.

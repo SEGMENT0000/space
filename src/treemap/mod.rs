@@ -18,8 +18,10 @@
 
 use crate::model::{Category, NO_NODE, NodeId};
 
-/// Maximum supported camera zoom. Keeps transforms well inside `f32` range.
-pub const MAX_SCALE: f32 = 64.0;
+/// Maximum supported camera zoom. Deep nesting keeps shrinking child rects,
+/// so the ceiling is deliberately high; it still leaves screen coordinates far
+/// below the range where `f32` loses whole pixels.
+pub const MAX_SCALE: f32 = 65_536.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Rect {
@@ -74,6 +76,80 @@ impl Rect {
 
     pub fn is_empty(&self) -> bool {
         self.w <= 0.5 || self.h <= 0.5
+    }
+}
+
+/// Screen-space content tiers for one tile. Thresholds use the transformed
+/// (screen) rect, so zooming changes what a tile can show exactly when the
+/// geometry does. `Large` tiles carry real content (thumbnail, text snippet,
+/// folder summary); `Medium` gets an icon; `Small` a measured name; `Tiny`
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TileTier {
+    Tiny,
+    Small,
+    Medium,
+    Large,
+}
+
+pub const LARGE_TILE_W: f32 = 200.0;
+pub const LARGE_TILE_H: f32 = 130.0;
+pub const MEDIUM_TILE_W: f32 = 110.0;
+pub const MEDIUM_TILE_H: f32 = 70.0;
+pub const SMALL_TILE_W: f32 = 60.0;
+pub const SMALL_TILE_H: f32 = 36.0;
+
+pub fn tile_tier(w: f32, h: f32) -> TileTier {
+    let (w, h) = if w.is_finite() && h.is_finite() {
+        (w.max(0.0), h.max(0.0))
+    } else {
+        (0.0, 0.0)
+    };
+    if w >= LARGE_TILE_W && h >= LARGE_TILE_H {
+        TileTier::Large
+    } else if w >= MEDIUM_TILE_W && h >= MEDIUM_TILE_H {
+        TileTier::Medium
+    } else if w >= SMALL_TILE_W && h >= SMALL_TILE_H {
+        TileTier::Small
+    } else {
+        TileTier::Tiny
+    }
+}
+
+/// Reserved content bands inside a Large tile. The bands are stacked and
+/// disjoint by construction, so a name, a body (thumbnail / text lines /
+/// summary bar) and a large size figure can never overlap or spill.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TileContentLayout {
+    pub name: Rect,
+    pub body: Rect,
+    pub size: Rect,
+}
+
+pub fn tile_content_layout(r: Rect, pad: f32, name_h: f32, size_h: f32) -> TileContentLayout {
+    let inner = r.inset(pad.max(0.0));
+    let name_h = name_h.max(0.0).min(inner.h);
+    let size_h = size_h.max(0.0).min(inner.h - name_h);
+    let body_h = (inner.h - name_h - size_h).max(0.0);
+    TileContentLayout {
+        name: Rect {
+            x: inner.x,
+            y: inner.y,
+            w: inner.w,
+            h: name_h,
+        },
+        body: Rect {
+            x: inner.x,
+            y: inner.y + name_h,
+            w: inner.w,
+            h: body_h,
+        },
+        size: Rect {
+            x: inner.x,
+            y: inner.y + name_h + body_h,
+            w: inner.w,
+            h: size_h,
+        },
     }
 }
 
@@ -264,7 +340,7 @@ fn layout_cells(areas: &[f64], ax: f64, ay: f64, right: f64, bottom: f64, out: &
         let mut sum = areas[start];
         let mut min = areas[start];
         let mut max = areas[start];
-        let current = worst(sum, min, max, side);
+        let mut current = worst(sum, min, max, side);
 
         while end < n {
             let a = areas[end];
@@ -279,6 +355,7 @@ fn layout_cells(areas: &[f64], ax: f64, ay: f64, right: f64, bottom: f64, out: &
             sum = next_sum;
             min = next_min;
             max = next_max;
+            current = next;
             end += 1;
         }
 
@@ -1298,6 +1375,51 @@ mod tests {
                 assert!(!l.text.contains('…'));
             }
         }
+    }
+
+    #[test]
+    fn tile_tier_thresholds_follow_screen_size() {
+        use TileTier::*;
+        assert_eq!(tile_tier(200.0, 130.0), Large);
+        assert_eq!(tile_tier(640.0, 480.0), Large);
+        assert_eq!(tile_tier(199.9, 130.0), Medium);
+        assert_eq!(tile_tier(200.0, 129.9), Medium);
+        assert_eq!(tile_tier(110.0, 70.0), Medium);
+        assert_eq!(tile_tier(109.9, 70.0), Small);
+        assert_eq!(tile_tier(110.0, 69.9), Small);
+        assert_eq!(tile_tier(60.0, 36.0), Small);
+        assert_eq!(tile_tier(59.9, 36.0), Tiny);
+        assert_eq!(tile_tier(60.0, 35.9), Tiny);
+        assert_eq!(tile_tier(0.0, 0.0), Tiny);
+        assert_eq!(tile_tier(f32::NAN, f32::INFINITY), Tiny);
+    }
+
+    #[test]
+    fn content_layout_bands_are_disjoint_and_inside_the_tile() {
+        for (w, h) in [
+            (200.0, 130.0),
+            (340.0, 500.0),
+            (201.0, 131.0),
+            (1200.0, 400.0),
+        ] {
+            let r = Rect::new(17.0, 9.0, w, h);
+            let layout = tile_content_layout(r, 10.0, 34.0, 30.0);
+            let bands = [layout.name, layout.body, layout.size];
+            for band in bands {
+                assert!(band.x >= r.x - 0.01 && band.y >= r.y - 0.01);
+                assert!(band.right() <= r.right() + 0.01);
+                assert!(band.bottom() <= r.bottom() + 0.01);
+                assert!(band.w >= 0.0 && band.h >= 0.0);
+            }
+            assert!((layout.name.bottom() - layout.body.y).abs() < 0.01);
+            assert!((layout.body.bottom() - layout.size.y).abs() < 0.01);
+        }
+
+        // Degenerate tiles collapse without ever inverting the bands.
+        let tiny = Rect::new(0.0, 0.0, 12.0, 10.0);
+        let layout = tile_content_layout(tiny, 10.0, 34.0, 30.0);
+        assert_eq!(layout.body.h, 0.0);
+        assert!(layout.size.bottom() <= tiny.bottom() + 0.01);
     }
 
     #[test]

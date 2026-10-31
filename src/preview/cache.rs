@@ -1,6 +1,9 @@
 //! Bounded, weighted LRU. Entry-capped at 256 and byte-capped so a run of
 //! decoded images cannot grow without bound. Clones are cheap for images
 //! because their pixels are shared through `Arc<[u8]>`.
+//!
+//! The same generic cache backs both the inspector preview cache and the
+//! on-tile art cache; each wrapper owns its caps and weight function.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -10,6 +13,78 @@ use crate::preview::Preview;
 pub const CACHE_ENTRIES: usize = 256;
 pub const CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Generic count- and byte-bounded LRU. Most recently used entries live at
+/// the back of the deque.
+pub(crate) struct Lru<K, V> {
+    entries: VecDeque<(K, V, usize)>,
+    bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+    weight: fn(&V) -> usize,
+}
+
+impl<K: PartialEq, V> Lru<K, V> {
+    pub fn new(max_entries: usize, max_bytes: usize, weight: fn(&V) -> usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(max_entries.min(64)),
+            bytes: 0,
+            max_entries: max_entries.max(1),
+            max_bytes: max_bytes.max(1),
+            weight,
+        }
+    }
+
+    pub fn get(&mut self, key: &K) -> Option<V>
+    where
+        V: Clone,
+        K: Clone,
+    {
+        let index = self.entries.iter().position(|(k, _, _)| k == key)?;
+        let (_, value, weight) = self.entries.remove(index)?;
+        self.bytes = self.bytes.saturating_sub(weight);
+        let out = value.clone();
+        // Re-insert through the normal path so the weight accounting stays in
+        // one place; a hit cannot exceed the budget because it already fit.
+        self.insert(key.clone(), value);
+        Some(out)
+    }
+
+    pub fn insert(&mut self, key: K, value: V) {
+        let weight = (self.weight)(&value);
+        if weight > self.max_bytes {
+            // A single entry larger than the whole budget is not cached;
+            // returning it still works, and the next request rebuilds it.
+            return;
+        }
+        if let Some(index) = self.entries.iter().position(|(k, _, _)| *k == key)
+            && let Some((_, _, old_weight)) = self.entries.remove(index)
+        {
+            self.bytes = self.bytes.saturating_sub(old_weight);
+        }
+        while self.entries.len() >= self.max_entries
+            || self.bytes.saturating_add(weight) > self.max_bytes
+        {
+            match self.entries.pop_front() {
+                Some((_, _, old_weight)) => self.bytes = self.bytes.saturating_sub(old_weight),
+                None => break,
+            }
+        }
+        self.entries.push_back((key, value, weight));
+        self.bytes = self.bytes.saturating_add(weight);
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Current byte total. Reachable from unit tests, which assert the byte
+    /// cap; the read-only build does not need it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct CacheKey {
     pub path: PathBuf,
@@ -18,63 +93,28 @@ pub struct CacheKey {
     pub is_dir: bool,
 }
 
-struct Entry {
-    key: CacheKey,
-    preview: Preview,
-    weight: usize,
-}
-
-/// Most recently used entries live at the back of the deque.
+/// Bounded preview cache for the inspector.
 pub struct PreviewCache {
-    entries: VecDeque<Entry>,
-    bytes: usize,
+    inner: Lru<CacheKey, Preview>,
 }
 
 impl PreviewCache {
     pub fn new() -> Self {
         Self {
-            entries: VecDeque::with_capacity(CACHE_ENTRIES),
-            bytes: 0,
+            inner: Lru::new(CACHE_ENTRIES, CACHE_BYTES, weight_of),
         }
     }
 
     pub fn get(&mut self, key: &CacheKey) -> Option<Preview> {
-        let index = self.entries.iter().position(|e| &e.key == key)?;
-        let entry = self.entries.remove(index)?;
-        let preview = entry.preview.clone();
-        self.entries.push_back(entry);
-        Some(preview)
+        self.inner.get(key)
     }
 
     pub fn insert(&mut self, key: CacheKey, preview: Preview) {
-        let weight = weight_of(&preview).saturating_add(key.path.as_os_str().len());
-        if weight > CACHE_BYTES {
-            // A single preview larger than the whole budget is not cached;
-            // returning it still works, and the next request rebuilds it.
-            return;
-        }
-        if let Some(index) = self.entries.iter().position(|e| e.key == key)
-            && let Some(old) = self.entries.remove(index)
-        {
-            self.bytes = self.bytes.saturating_sub(old.weight);
-        }
-        while self.entries.len() >= CACHE_ENTRIES || self.bytes.saturating_add(weight) > CACHE_BYTES
-        {
-            match self.entries.pop_front() {
-                Some(old) => self.bytes = self.bytes.saturating_sub(old.weight),
-                None => break,
-            }
-        }
-        self.entries.push_back(Entry {
-            key,
-            preview,
-            weight,
-        });
-        self.bytes = self.bytes.saturating_add(weight);
+        self.inner.insert(key, preview);
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.inner.len()
     }
 }
 
@@ -198,6 +238,13 @@ mod tests {
         })
     }
 
+    fn byte_weight(preview: &Preview) -> usize {
+        match preview {
+            Preview::Image(i) => i.rgba.len(),
+            _ => 0,
+        }
+    }
+
     #[test]
     fn byte_budget_evicts_older_large_previews() {
         let mut cache = PreviewCache::new();
@@ -206,7 +253,7 @@ mod tests {
         let pixels: Arc<[u8]> = vec![7u8; 4 * 1024 * 1024].into();
         for i in 0..20 {
             cache.insert(image_key(i), large_image(&pixels));
-            assert!(cache.bytes <= CACHE_BYTES);
+            assert!(cache.inner.bytes() <= CACHE_BYTES);
         }
         assert!(cache.len() < 20, "byte cap did not evict");
         assert_eq!(cache.get(&image_key(19)).map(|p| p.kind()), Some("IMAGE"));
@@ -214,5 +261,53 @@ mod tests {
             cache.get(&image_key(0)).is_none(),
             "oldest entry was evicted"
         );
+    }
+
+    #[test]
+    fn entry_cap_evicts_oldest_before_the_byte_cap() {
+        let mut cache = Lru::new(4, 1024, byte_weight);
+        for i in 0..6 {
+            cache.insert(
+                i,
+                Preview::Unavailable {
+                    reason: format!("r{i}"),
+                },
+            );
+            assert!(cache.len() <= 4);
+            assert!(cache.bytes() <= 1024);
+        }
+        assert_eq!(cache.len(), 4);
+        assert!(cache.get(&0).is_none());
+        assert!(cache.get(&5).is_some());
+    }
+
+    #[test]
+    fn byte_cap_evicts_lru_entries_and_touch_refreshes() {
+        let mut cache = Lru::new(64, 3 * 1024, byte_weight);
+        let pixels: Arc<[u8]> = vec![1u8; 1024].into();
+        for i in 0..4 {
+            cache.insert(i, large_image(&pixels));
+        }
+        assert!(cache.bytes() <= 3 * 1024);
+        assert_eq!(cache.len(), 3, "byte cap must evict the oldest entry");
+        assert!(cache.get(&0).is_none());
+        // Touching entry 1 makes entry 2 the oldest.
+        assert!(cache.get(&1).is_some());
+        cache.insert(4, large_image(&pixels));
+        assert!(
+            cache.get(&2).is_none(),
+            "untouched entry should evict first"
+        );
+        assert!(cache.get(&1).is_some(), "recently used entry must survive");
+        assert!(cache.bytes() <= 3 * 1024);
+    }
+
+    #[test]
+    fn an_entry_larger_than_the_budget_is_never_cached() {
+        let mut cache = Lru::new(8, 512, byte_weight);
+        let pixels: Arc<[u8]> = vec![0u8; 1024].into();
+        cache.insert(0, large_image(&pixels));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
     }
 }

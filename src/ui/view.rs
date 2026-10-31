@@ -11,12 +11,68 @@ use iced::{
 use crate::model::{Category, ScanSummary};
 use crate::ui::app::{
     APP_BAR_HEIGHT, App, ExplorerMode, Message, STATUS_HEIGHT, SUMMARY_HEIGHT, Screen,
+    navigation_availability,
 };
 use crate::ui::canvas::{CanvasPalette, TreemapCanvas, TreemapGpuProgram};
 use crate::ui::components::*;
 use crate::ui::icon::{Icon, icon};
 use crate::ui::theme::{self, Theme};
 use crate::ui::{FILTER_INPUT, fmt};
+
+/// Breadcrumb labels start at the scan root. A drive root gets its trailing
+/// separator back (`C:` -> `C:\`); every other root uses the scanned folder's
+/// own name rather than a tail-elided absolute path.
+pub(crate) fn root_crumb_label(name: &str) -> String {
+    if name.len() == 2 && name.ends_with(':') {
+        format!("{name}\\")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Visible breadcrumb entries. Long lineages collapse to root, an ellipsis,
+/// the two nearest ancestors and the current folder. The ellipsis opens the
+/// hidden-ancestor menu rather than silently jumping to one level.
+pub(crate) fn breadcrumb_entries(
+    lineage: &[crate::model::NodeId],
+) -> Vec<(crate::model::NodeId, bool, bool)> {
+    let Some(&root) = lineage.first() else {
+        return Vec::new();
+    };
+    if lineage.len() > 4 {
+        vec![
+            (root, false, false),
+            (lineage[lineage.len() - 3], true, false),
+            (lineage[lineage.len() - 2], false, false),
+            (lineage[lineage.len() - 1], false, true),
+        ]
+    } else {
+        lineage
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, false, index + 1 == lineage.len()))
+            .collect()
+    }
+}
+
+/// Ancestors hidden between the root and the last two visible crumbs.
+pub(crate) fn hidden_ancestors(lineage: &[crate::model::NodeId]) -> &[crate::model::NodeId] {
+    if lineage.len() <= 4 {
+        &[]
+    } else {
+        &lineage[1..lineage.len() - 3]
+    }
+}
+
+fn folders_note(dirs: u64, errors: u64) -> String {
+    if errors > 0 {
+        format!("{} skipped", fmt::count(errors))
+    } else if dirs == 0 {
+        "files only".to_string()
+    } else {
+        "indexed".to_string()
+    }
+}
 
 pub fn view(app: &App) -> Element<'_, Message> {
     let t = Theme::for_dark(app.dark);
@@ -35,6 +91,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
     if let Some(context) = &app.context {
         stack = stack.push(super::overlays::context_menu(app, &t, context));
     }
+    if app.crumbs_open {
+        stack = stack.push(super::overlays::breadcrumb_menu(app, &t));
+    }
+    if app.settings_open {
+        stack = stack.push(super::overlays::settings_panel(app, &t));
+    }
     if app.drag_hover {
         stack = stack.push(super::overlays::drop_overlay(&t));
     }
@@ -49,42 +111,12 @@ fn explorer<'a>(app: &'a App, t: &Theme) -> Element<'a, Message> {
     let Some(output) = &app.output else {
         return drives_fallback(app, &t);
     };
-    let root = output.summary.root_path.clone();
-
-    let header = container(
-        row![
-            column![
-                label("Explorer", theme::TEXT_MD, Weight::Semibold, t.ink),
-                label(
-                    format!(
-                        "{} · sized by bytes. Double-click a folder to open it.",
-                        fmt::short_path(&root, 58)
-                    ),
-                    theme::TEXT_SM,
-                    Weight::Normal,
-                    t.ink_muted
-                ),
-            ]
-            .spacing(2),
-            iced::widget::Space::new().width(Length::Fill),
-            mode_switch(app, &t),
-            rail_toggle(app, &t),
-        ]
-        .align_y(Alignment::Center)
-        .spacing(8),
-    )
-    .height(Length::Fixed(60.0))
-    .padding(Padding::from([0.0, 16.0]))
-    .width(Length::Fill)
-    .style(move |_| container::Style::default());
 
     let toolbar = toolbar(app, &t);
     let map = map_content(app, &t);
     let legend = legend(app, &t, &output.summary);
 
     let map_panel = container(column![
-        header,
-        hline(t.hairline),
         toolbar,
         hline(t.hairline),
         map,
@@ -295,6 +327,17 @@ pub fn app_bar<'a>(app: &'a App, t: &Theme) -> Element<'a, Message> {
             row![
                 read_only,
                 icon_button(theme_icon, 15.0, Message::ThemeToggle, t.ink_muted, &t),
+                icon_button(
+                    Icon::Settings,
+                    15.0,
+                    Message::ToggleSettings,
+                    if app.settings_open {
+                        t.ink
+                    } else {
+                        t.ink_muted
+                    },
+                    &t
+                ),
                 palette,
             ]
             .spacing(4)
@@ -387,11 +430,7 @@ pub fn summary_strip<'a>(app: &'a App, t: &Theme, summary: &ScanSummary) -> Elem
         summary_cell(
             "Folders",
             fmt::count(summary.dirs),
-            if summary.errors > 0 {
-                format!("{} skipped", fmt::count(summary.errors))
-            } else {
-                "indexed".to_string()
-            },
+            folders_note(summary.dirs, summary.errors),
             &t,
         ),
         summary_cell(
@@ -557,93 +596,218 @@ fn toolbar<'a>(app: &'a App, t: &Theme) -> Element<'a, Message> {
     let Some(tree) = app.tree() else {
         return iced::widget::Space::new().into();
     };
+    let root = tree.root();
     let lineage = tree.lineage(app.current);
+    let nav = navigation_availability(app.history_pos, app.history.len(), app.current, root);
+    let back = navigation_button(Icon::ArrowLeft, Message::Back, nav.can_back, "Back", &t);
+    let forward = navigation_button(
+        Icon::ArrowRight,
+        Message::Forward,
+        nav.can_forward,
+        "Forward",
+        &t,
+    );
+    let up = navigation_button(
+        Icon::UpLeft,
+        Message::GoUp,
+        nav.can_up,
+        "Go up one level",
+        &t,
+    );
+
+    let root_label = root_crumb_label(tree.name(root));
+    let entries = breadcrumb_entries(&lineage);
+
     let mut crumbs: Vec<Element<'a, Message>> = Vec::new();
-    let keep = 4usize;
-    let mut entries: Vec<(bool, crate::model::NodeId)> = Vec::new();
-    if lineage.len() > keep {
-        entries.push((false, lineage[0]));
-        entries.push((false, 0));
-        for id in lineage.iter().skip(lineage.len() - 2) {
-            entries.push((false, *id));
-        }
-    } else {
-        for id in lineage.iter() {
-            entries.push((false, *id));
-        }
-    }
-    for (i, (_, id)) in entries.iter().enumerate() {
-        let is_last = i + 1 == entries.len();
-        if *id == 0 && lineage.len() > keep && i == 1 {
-            crumbs.push(label("…", 12.0, Weight::Normal, t.ink_faint).into());
-            continue;
-        }
-        let name = if *id == 0 {
-            tree.name(0).to_string()
-        } else {
-            tree.name(*id).to_string()
-        };
-        let display = if i == 0 {
-            if name.len() == 2 && name.ends_with(':') {
-                format!("{name}\\")
-            } else {
-                name
-            }
-        } else {
-            name
-        };
-        if !is_last {
-            crumbs.push(
-                button(label(display, 12.0, Weight::Normal, t.ink_muted))
-                    .padding(Padding::from([3.0, 4.0]))
-                    .on_press(Message::Drill(*id))
-                    .style(quiet_text_style(t))
-                    .into(),
-            );
+    for (index, (id, ellipsis, current)) in entries.iter().enumerate() {
+        if index > 0 {
             crumbs.push(icon(Icon::ChevronRight, 11.0, t.ink_faint));
-        } else {
-            let compact = theme::truncated(&display, 30);
-            crumbs.push(label(compact, 12.5, Weight::Semibold, t.ink).into());
         }
-    }
-    if crumbs.is_empty() {
-        crumbs.push(label(tree.name(0), 12.5, Weight::Semibold, t.ink).into());
+        if *ellipsis {
+            crumbs.push(crumb_ellipsis(app, &t));
+        } else {
+            let name = if *id == root {
+                root_label.clone()
+            } else {
+                tree.name(*id).to_string()
+            };
+            crumbs.push(crumb_button(name, *id, *current, &t));
+        }
     }
 
-    let _total = tree.node(app.current).size;
+    let volumes = button(label("Volumes", 11.5, Weight::Medium, t.ink_muted))
+        .padding(Padding::from([4.0, 6.0]))
+        .on_press(Message::Go(Screen::Drives))
+        .style(quiet_text_style(t));
     let filter = filter_input(app, &t);
-    let refit: Element<'a, Message> = if app.camera.is_identity() {
-        iced::widget::Space::new().into()
+    let identity = app.camera.is_identity();
+    let refit_color = if identity {
+        Color {
+            a: 0.38,
+            ..t.ink_faint
+        }
     } else {
-        button(
-            row![
-                icon(Icon::Maximize, 12.0, t.ink_muted),
-                label("Refit", 11.5, Weight::Medium, t.ink_muted),
-            ]
-            .spacing(4)
-            .align_y(Alignment::Center),
-        )
-        .padding(Padding::from([4.0, 7.0]))
-        .on_press(Message::Refit)
-        .style(quiet_text_style(t))
-        .into()
+        t.ink_muted
     };
+    let mut refit = button(
+        row![
+            icon(Icon::Maximize, 12.0, refit_color),
+            label("Refit", 11.5, Weight::Medium, refit_color),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([4.0, 7.0]))
+    .width(Length::Fixed(64.0))
+    .style({
+        let hover = t.surface_sunken;
+        move |_iced: &IcedTheme, status| button::Style {
+            background: if !identity
+                && matches!(status, button::Status::Hovered | button::Status::Pressed)
+            {
+                Some(Background::Color(hover))
+            } else {
+                None
+            },
+            text_color: refit_color,
+            border: Border::default(),
+            shadow: iced::Shadow::default(),
+            snap: true,
+        }
+    });
+    if !identity {
+        refit = refit.on_press(Message::Refit);
+    }
 
     container(
         row![
+            row![back, forward, up, volumes]
+                .spacing(2)
+                .align_y(Alignment::Center),
             row(crumbs).spacing(1).align_y(Alignment::Center),
             iced::widget::Space::new().width(Length::Fill),
             refit,
             filter,
+            mode_switch(app, &t),
+            rail_toggle(app, &t),
         ]
-        .spacing(8)
+        .spacing(5)
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
     .height(Length::Fixed(44.0))
-    .padding(Padding::from([0.0, 16.0]))
+    .padding(Padding::from([0.0, 12.0]))
     .style(|_| container::Style::default())
     .into()
+}
+
+fn crumb_ellipsis<'a>(app: &App, t: &Theme) -> Element<'a, Message> {
+    let t = *t;
+    let open = app.crumbs_open;
+    button(label("…", 15.0, Weight::Semibold, t.ink_muted))
+        .width(Length::Fixed(30.0))
+        .height(Length::Fixed(28.0))
+        .padding(0)
+        .on_press(Message::ToggleCrumbMenu)
+        .style({
+            let hover = t.surface_sunken;
+            move |_iced: &IcedTheme, status| button::Style {
+                background: if open
+                    || matches!(status, button::Status::Hovered | button::Status::Pressed)
+                {
+                    Some(Background::Color(hover))
+                } else {
+                    None
+                },
+                text_color: t.ink_muted,
+                border: Border::default(),
+                shadow: iced::Shadow::default(),
+                snap: true,
+            }
+        })
+        .into()
+}
+
+fn crumb_button<'a>(
+    name: String,
+    id: crate::model::NodeId,
+    current: bool,
+    t: &Theme,
+) -> Element<'a, Message> {
+    let t = *t;
+    let display = if id == 0 && name.len() == 2 && name.ends_with(':') {
+        format!("{name}\\")
+    } else {
+        name
+    };
+    let display = if current {
+        theme::truncated(&display, 30)
+    } else {
+        display
+    };
+    button(label(
+        display,
+        if current { 12.5 } else { 12.0 },
+        if current {
+            Weight::Semibold
+        } else {
+            Weight::Normal
+        },
+        if current { t.ink } else { t.ink_muted },
+    ))
+    .padding(Padding::from([3.0, 4.0]))
+    .on_press(Message::Drill(id))
+    .style(quiet_text_style(t))
+    .into()
+}
+
+fn navigation_button<'a>(
+    glyph: Icon,
+    message: Message,
+    enabled: bool,
+    tooltip: &'static str,
+    t: &Theme,
+) -> Element<'a, Message> {
+    let t = *t;
+    let color = if enabled {
+        t.ink_muted
+    } else {
+        Color {
+            a: 0.38,
+            ..t.ink_faint
+        }
+    };
+    let glyph = container(icon(glyph, 16.0, color))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center);
+    let button = button(glyph)
+        .width(Length::Fixed(30.0))
+        .height(Length::Fixed(30.0))
+        .padding(0)
+        .style({
+            let hover = t.surface_sunken;
+            move |_iced: &IcedTheme, status| button::Style {
+                background: if enabled
+                    && matches!(status, button::Status::Hovered | button::Status::Pressed)
+                {
+                    Some(Background::Color(hover))
+                } else {
+                    None
+                },
+                text_color: color,
+                border: Border::default(),
+                shadow: iced::Shadow::default(),
+                snap: true,
+            }
+        });
+    let button = if enabled {
+        button.on_press(message)
+    } else {
+        button
+    };
+    iced::widget::tooltip(button, tooltip, iced::widget::tooltip::Position::Bottom).into()
 }
 
 fn quiet_text_style(t: Theme) -> impl Fn(&IcedTheme, button::Status) -> button::Style + 'static {
@@ -779,6 +943,7 @@ fn map_content<'a>(app: &'a App, t: &Theme) -> Element<'a, Message> {
         camera: app.camera,
         palette: palette.clone(),
     };
+    let (art, icons) = app.tiles.handles();
     let overlay = TreemapCanvas {
         output: output.clone(),
         dir: app.current,
@@ -790,6 +955,9 @@ fn map_content<'a>(app: &'a App, t: &Theme) -> Element<'a, Message> {
         palette: palette.clone(),
         empty_hint: empty,
         fills: false,
+        art,
+        icons,
+        report: app.tile_report.clone(),
     };
     let layers: Element<'a, Message> = iced::widget::Stack::new()
         .width(Length::Fill)
@@ -1173,4 +1341,43 @@ fn drives_cell<'a>(
     .padding(Padding::from([14.0, 20.0]))
     .align_y(Alignment::Center)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_crumb_keeps_the_drive_separator_and_folder_name() {
+        assert_eq!(root_crumb_label("C:"), "C:\\");
+        assert_eq!(root_crumb_label("space"), "space");
+        assert_eq!(root_crumb_label("Downloads"), "Downloads");
+    }
+
+    #[test]
+    fn long_breadcrumbs_keep_root_ellipsis_and_the_nearest_folders() {
+        let lineage = vec![0, 1, 2, 3, 4, 5, 6];
+        let entries = breadcrumb_entries(&lineage);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].0, 0, "root stays first");
+        assert!(!entries[0].2);
+        assert!(entries[1].1, "the second entry is the ancestor menu");
+        assert_eq!(entries[1].0, 4);
+        assert_eq!(entries[2].0, 5);
+        assert_eq!(entries[3].0, 6);
+        assert!(entries[3].2, "the current folder is emphasized");
+        assert_eq!(hidden_ancestors(&lineage), &[1, 2, 3]);
+
+        let short = breadcrumb_entries(&[0, 1, 2]);
+        assert_eq!(short.len(), 3);
+        assert!(short.iter().all(|(_, ellipsis, _)| !ellipsis));
+        assert!(hidden_ancestors(&[0, 1, 2]).is_empty());
+    }
+
+    #[test]
+    fn zero_folders_no_longer_claims_indexing_happened() {
+        assert_eq!(folders_note(0, 0), "files only");
+        assert_eq!(folders_note(12, 0), "indexed");
+        assert_eq!(folders_note(12, 3), "3 skipped");
+    }
 }

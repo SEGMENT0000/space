@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex};
 
-mod cache;
+pub(crate) mod cache;
 mod db;
 mod hex;
 mod images;
@@ -20,7 +20,16 @@ mod list;
 mod media;
 mod meta;
 mod text;
+mod tiles;
 mod util;
+#[cfg(windows)]
+mod winmeta;
+#[cfg(windows)]
+mod winthumb;
+
+pub use tiles::{
+    FactKind, TILE_IMAGE_EDGE_MAX, TileArt, TileKind, TileService, tile_kind_for_name,
+};
 
 use cache::{CacheKey, PreviewCache};
 use util::{TEXT_CAP, at, ext_lower, read_head};

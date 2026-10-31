@@ -1,9 +1,9 @@
 //! Classification of a filesystem entry into one of eight product categories.
 //!
-//! Classification is intentionally path-aware. The extension alone is not
-//! enough: a `.dll` under `C:\Windows` is system software, a `.js` file under
-//! `node_modules` is a dependency, and the contents of `%TEMP%` are caches
-//! even when they happen to end in `.txt`.
+//! Known extensions decide a file's category before directory context. A
+//! picture inside `target` is still Media, and an archive inside `.cargo` is
+//! still Archives. DLLs are Apps except inside the drive/share-root Windows
+//! directory, where they are System.
 //!
 //! The hot scan path precomputes a [`DirContext`] once per directory and then
 //! classifies every entry in it without touching the path again. The public
@@ -12,19 +12,13 @@
 //!
 //! Priority when several rules match:
 //!
-//! 1. A forced path context: System (Windows/ProgramData/drivers), Apps
-//!    (Program Files/WindowsApps/installed bundles), Code (dependency dirs
-//!    such as `node_modules`), Caches (Temp/INetCache/browser caches).
-//! 2. Known system filenames (`pagefile.sys`, registry hives, …).
-//! 3. Known cache filenames (`thumbs.db`, …).
-//! 4. Known build filenames (`Makefile`, `Cargo.lock`, …).
-//! 5. The extension table.
-//! 6. A soft path context (Documents/Pictures/Archives/`src`) and finally
-//!    `Other`.
+//! 1. The extension table (with the Windows DLL exception).
+//! 2. Known system, cache and build filenames without a recognized extension.
+//! 3. A strong path context: System, Apps, Code or Caches.
+//! 4. A soft path context (Documents/Pictures/Archives/`src`), then `Other`.
 //!
-//! Files without an extension are `Other` unless a path context (or one of
-//! the small known-name sets above) says otherwise. Directories use the same
-//! path context and never need an extension to be classified.
+//! Missing and unrecognized extensions both reach the fallback rules.
+//! Directories use path context only, never a filename-extension rule.
 
 use std::path::Path;
 
@@ -84,6 +78,8 @@ pub(crate) struct DirContext {
     forced: Option<Forced>,
     fallback: Option<Category>,
     appdata: AppDataState,
+    /// Separate from general System context: project DLLs are not OS files.
+    windows: bool,
 }
 
 impl DirContext {
@@ -134,6 +130,7 @@ impl DirContext {
         }
 
         if parent_is_drive_root {
+            out.windows |= name.eq_ignore_ascii_case("Windows");
             if is_root_system(name) {
                 out.set_forced(Forced::System);
             } else if is_root_apps(name) {
@@ -199,6 +196,7 @@ impl DirContext {
         }
 
         if at_root {
+            self.windows |= name.eq_ignore_ascii_case("Windows");
             if is_root_system(name) {
                 self.set_forced(Forced::System);
             } else if is_root_apps(name) {
@@ -277,8 +275,20 @@ pub fn classify_entry(name: &str, parent: &Path, is_dir: bool) -> Category {
 /// Classify with an already-computed directory context. `pub(crate)` because
 /// the walkers are its only hot-path caller.
 pub(crate) fn classify_with_ctx(name: &str, ctx: DirContext, is_dir: bool) -> Category {
-    if let Some(forced) = ctx.forced {
-        return forced.category();
+    if is_dir {
+        return ctx
+            .forced
+            .map(Forced::category)
+            .or(ctx.fallback)
+            .unwrap_or(Category::Other);
+    }
+
+    if let Some(category) = extension_category(name) {
+        return if ctx.windows && ends_with_ci(name, ".dll") {
+            Category::System
+        } else {
+            category
+        };
     }
 
     if is_system_file_name(name) {
@@ -291,13 +301,12 @@ pub(crate) fn classify_with_ctx(name: &str, ctx: DirContext, is_dir: bool) -> Ca
         return Category::Code;
     }
 
-    if let Some(category) = extension_category(name) {
-        return category;
+    if let Some(forced) = ctx.forced {
+        return forced.category();
     }
     if let Some(category) = ctx.fallback {
         return category;
     }
-    let _ = is_dir;
     Category::Other
 }
 
@@ -690,16 +699,16 @@ fn extension_lower<'a>(name: &str, buf: &'a mut [u8; MAX_EXT]) -> Option<&'a [u8
 fn extension_category(name: &str) -> Option<Category> {
     let mut buf = [0u8; MAX_EXT];
     let ext = extension_lower(name, &mut buf)?;
-    Some(classify_ext(ext))
+    classify_ext(ext)
 }
 
-fn classify_ext(ext: &[u8]) -> Category {
-    match ext {
+fn classify_ext(ext: &[u8]) -> Option<Category> {
+    Some(match ext {
         // Media — images.
         b"jpg" | b"jpeg" | b"jpe" | b"png" | b"gif" | b"webp" | b"bmp" | b"svg"
         | b"svgz" | b"heic" | b"heif" | b"avif" | b"jxl" | b"raw" | b"tiff" | b"tif"
         | b"ico" | b"cr2" | b"cr3" | b"nef" | b"arw" | b"dng" | b"orf" | b"raf"
-        | b"rw2" | b"psd" | b"ai" | b"indd" | b"eps" | b"blend" | b"fbx" | b"obj"
+        | b"rw2" | b"psd" | b"ai" | b"indd" | b"eps" | b"blend" | b"fbx"
         | b"stl" | b"gltf" | b"glb"
         // Media — video.
         | b"mp4" | b"mov" | b"avi" | b"mkv" | b"webm" | b"m4v" | b"wmv" | b"flv"
@@ -729,17 +738,17 @@ fn classify_ext(ext: &[u8]) -> Category {
         | b"groovy" | b"gradle" | b"cmake" | b"mk" | b"make" | b"ninja" | b"bazel"
         | b"bzl" | b"proto" | b"graphql" | b"gql" | b"wasm" | b"wat" | b"asm"
         | b"s" | b"v" | b"sv" | b"sln" | b"vcxproj" | b"csproj" | b"fsproj"
-        | b"vbproj" | b"props" | b"targets" | b"o" | b"a" | b"lib" | b"pdb"
-        | b"rlib" | b"d" | b"class" | b"pyc" | b"pyo" | b"ini" | b"cfg" | b"conf"
+        | b"vbproj" | b"props" | b"targets" | b"o" | b"obj" | b"a" | b"lib" | b"pdb"
+        | b"rlib" | b"rmeta" | b"d" | b"class" | b"pyc" | b"pyo" | b"ini" | b"cfg" | b"conf"
         | b"config" | b"properties" | b"env" | b"editorconfig" => Category::Code,
 
         // Apps — installed programs, installers and app packages.
         b"exe" | b"com" | b"msi" | b"msix" | b"msixbundle" | b"appx" | b"appxbundle"
         | b"appimage" | b"deb" | b"rpm" | b"pkg" | b"apk" | b"ipa" | b"app"
-        | b"scr" => Category::Apps,
+        | b"scr" | b"dll" => Category::Apps,
 
         // System — drivers, system libraries and OS metadata.
-        b"sys" | b"drv" | b"dll" | b"ocx" | b"cpl" | b"efi" | b"mui" | b"inf"
+        b"sys" | b"drv" | b"ocx" | b"cpl" | b"efi" | b"mui" | b"inf"
         | b"cat" | b"msstyles" | b"themepack" | b"reg" => Category::System,
 
         // Archives — compressed files, backups and disk images.
@@ -752,6 +761,6 @@ fn classify_ext(ext: &[u8]) -> Category {
         // Caches / temporary data by extension.
         b"tmp" | b"temp" | b"dmp" => Category::Caches,
 
-        _ => Category::Other,
-    }
+        _ => return None,
+    })
 }

@@ -203,6 +203,23 @@ fn empty_single_zero_and_sentinel() {
 }
 
 #[test]
+fn equal_sizes_make_readable_cells_instead_of_thin_strips() {
+    let area = Rect::new(0.0, 0.0, 800.0, 800.0);
+    let items: Vec<_> = (0..64).map(|id| item(id, 1_000)).collect();
+    let tiles = treemap::squarify(area, &items, 0.0);
+    check_geometry(area, &tiles, 0.01);
+    check_area_proportions(area, &items, &tiles);
+    for tile in tiles {
+        let aspect = tile.rect.w.max(tile.rect.h) / tile.rect.w.min(tile.rect.h);
+        assert!(
+            aspect <= 1.2,
+            "equal file sizes should make compact cells: {aspect}"
+        );
+        assert!(tile.rect.w >= 90.0 && tile.rect.h >= 90.0);
+    }
+}
+
+#[test]
 fn duplicate_sizes_keep_input_order() {
     let items: Vec<Item> = (1..=50).map(|id| item(id, 7)).collect();
     let a = Rect::new(0.0, 0.0, 800.0, 500.0);

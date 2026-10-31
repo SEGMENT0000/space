@@ -13,6 +13,7 @@ mod palette;
 mod platform;
 mod scan;
 mod theme;
+mod tile_art;
 mod view;
 
 use std::time::Duration;
